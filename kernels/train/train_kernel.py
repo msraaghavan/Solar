@@ -130,7 +130,7 @@ command = [
     "--lr", LR,
     "--val-every", str(VAL_EVERY),
     "--val-files", str(VAL_FILES),
-    "--workers", "2",
+    "--workers", os.environ.get("WORKERS", "4"),
 ]
 print(" ".join(command), flush=True)
 

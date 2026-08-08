@@ -36,17 +36,31 @@ def run(*command: str) -> str:
     return result.stdout
 
 
-def wait_for_src(timeout: float = 600.0) -> None:
-    """Block until the published dataset matches the local train.py byte-for-byte."""
-    local = os.path.getsize(os.path.join(REPO, "src", "train.py"))
+def dataset_updated_at() -> str:
+    """Publication timestamp of the source dataset, as Kaggle reports it."""
+    for line in run("datasets", "list", "-m", "-s", "filament-src").splitlines():
+        if line.startswith(f"{USER}/filament-src"):
+            # ref  title  size  lastUpdated(date time)  ...
+            parts = line.split()
+            return f"{parts[3]} {parts[4]}"
+    return ""
+
+
+def wait_for_src(previous: str, timeout: float = 900.0) -> None:
+    """Block until Kaggle reports a *newer* version than ``previous``.
+
+    Comparing file sizes is not enough: a module that did not change this round
+    already has the expected size in the previous version, so the check passes
+    instantly while other modules are still uploading.  That is precisely the
+    failure that silently trains stale code, so the gate is the publication
+    timestamp advancing instead.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        for line in run("datasets", "files", f"{USER}/filament-src").splitlines():
-            parts = line.split()
-            if parts and parts[0] == "train.py" and parts[1].isdigit():
-                if int(parts[1]) == local:
-                    print(f"  source dataset live ({local} bytes)")
-                    return
+        current = dataset_updated_at()
+        if current and current != previous:
+            print(f"  source dataset published at {current}")
+            return
         time.sleep(15)
     raise SystemExit("timed out waiting for the source dataset to publish")
 
@@ -67,9 +81,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.no_sync:
-        print("publishing src/ ...")
+        previous = dataset_updated_at()
+        print(f"publishing src/ (previous version {previous or 'none'}) ...")
         subprocess.run([sys.executable, os.path.join(REPO, "tools", "sync_src.py")], check=True)
-        wait_for_src()
+        wait_for_src(previous)
 
     slug = f"filament-{args.name}"
     stage = os.path.join(REPO, "kernels", "_runs", slug)

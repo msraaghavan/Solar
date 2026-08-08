@@ -1,0 +1,16 @@
+{
+  "id": "raaghavanms/filament-eval",
+  "title": "filament-eval",
+  "code_file": "eval_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["raaghavanms/filament-src", "raaghavanms/filament-cache"],
+  "competition_sources": ["competitions/filament-segmentation-2026"],
+  "kernel_sources": ["raaghavanms/filament-b4-f0"],
+  "model_sources": []
+}
