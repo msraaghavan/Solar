@@ -160,11 +160,18 @@ def preflight(
         raise RuntimeError("preflight: non-finite features from the dataloader")
 
     model.train()
-    t0 = time.time()
-    with torch.autocast(device_type=device.split(":")[0], enabled=amp):
-        loss = criterion(model(features), target, weight)
-    loss.backward()
-    step_time = time.time() - t0
+    # Time three steps and keep the fastest.  The first pass on CUDA pays for
+    # kernel autotuning and allocator warm-up - it measured 14 s against a true
+    # 0.26 s, which turned a 2 h estimate into a nonsensical 106 h.
+    step_time = float("inf")
+    for _ in range(3):
+        t0 = time.time()
+        with torch.autocast(device_type=device.split(":")[0], enabled=amp):
+            loss = criterion(model(features), target, weight)
+        loss.backward()
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        step_time = min(step_time, time.time() - t0)
     if not math.isfinite(loss.item()):
         raise RuntimeError(f"preflight: non-finite loss {loss.item()}")
 
