@@ -68,6 +68,7 @@ def predict_full(
     window = _cosine_window(tile_size)
 
     origins = _tile_origins(context, tile_size, stride)
+    nonfinite_batches = [0]
 
     for start in range(0, len(origins), batch_size):
         chunk = origins[start : start + batch_size]
@@ -80,21 +81,47 @@ def predict_full(
             (len(chunk), 1, tile_size, tile_size), dtype=torch.float32, device=device
         )
         for k in range(tta):
+            view = _dihedral(batch, k)
             with torch.autocast(device_type=device.split(":")[0], enabled=amp):
-                logits = model(_dihedral(batch, k))
+                logits = model(view)
             # A model trained with the auxiliary spine head emits two channels;
             # only channel 0 is the filament mask.  Slicing here rather than
             # assuming one channel keeps spine and non-spine checkpoints on the
             # same inference path.
-            logits = logits[:, :1]
-            probs += torch.sigmoid(_dihedral_inverse(logits, k).float())
+            logits = logits[:, :1].float()
+
+            # Half precision overflows for larger encoders: EfficientNet-B4
+            # produced non-finite activations on a T4 where B0 never did.  A NaN
+            # is silently *lost* downstream rather than raised - every comparison
+            # against it is False, so the pixel drops out as background and the
+            # mask is quietly corrupted.  Recompute the offending batch in full
+            # precision instead of letting that through.
+            if not torch.isfinite(logits).all():
+                nonfinite_batches[0] += 1
+                with torch.autocast(device_type=device.split(":")[0], enabled=False):
+                    logits = model(view.float())[:, :1].float()
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+
+            probs += torch.sigmoid(_dihedral_inverse(logits, k))
         probs /= tta
 
         for (y0, x0), prob in zip(chunk, probs.cpu().numpy()[:, 0]):
             accumulator[y0 : y0 + tile_size, x0 : x0 + tile_size] += prob * window
             weights[y0 : y0 + tile_size, x0 : x0 + tile_size] += window
 
-    return np.divide(accumulator, weights, out=np.zeros_like(accumulator), where=weights > 0)
+    if nonfinite_batches[0]:
+        print(
+            f"    [infer] recomputed {nonfinite_batches[0]} tile batch(es) in fp32 "
+            f"after non-finite half-precision output",
+            flush=True,
+        )
+
+    probability = np.divide(
+        accumulator, weights, out=np.zeros_like(accumulator), where=weights > 0
+    )
+    if not np.isfinite(probability).all():
+        raise RuntimeError("non-finite probability map survived the fp32 fallback")
+    return probability
 
 
 def _tile_origins(
