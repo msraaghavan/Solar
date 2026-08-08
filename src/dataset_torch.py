@@ -91,7 +91,7 @@ class FilamentTiles(Dataset):
         )
 
         y0, x0 = self._choose_origin(rng, sample, context)
-        features = context.tile_features(image, y0, x0, self.tile_size)
+        features, weight = context.tile_planes(image, y0, x0, self.tile_size)
         target = mask[y0 : y0 + self.tile_size, x0 : x0 + self.tile_size].astype(np.float32)[None]
 
         if self.with_spine:
@@ -100,10 +100,9 @@ class FilamentTiles(Dataset):
                 [target, spine[y0 : y0 + self.tile_size, x0 : x0 + self.tile_size].astype(np.float32)[None]]
             )
 
-        # Only on-disk pixels carry information; off-disk is trivially negative
-        # and would otherwise dominate tiles that straddle the limb.  Taken from
-        # the geometry, not recovered from the (standardised) radius plane.
-        weight = context.tile_disk_mask(y0, x0, self.tile_size)
+        # ``weight`` above marks on-disk pixels: off-disk is trivially negative and
+        # would otherwise dominate tiles straddling the limb.  It comes from the
+        # geometry, never from inverting the standardised radius plane.
 
         if self.augment:
             features, target, weight = self._augment(rng, features, target, weight)
