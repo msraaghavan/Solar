@@ -82,6 +82,11 @@ def predict_full(
         for k in range(tta):
             with torch.autocast(device_type=device.split(":")[0], enabled=amp):
                 logits = model(_dihedral(batch, k))
+            # A model trained with the auxiliary spine head emits two channels;
+            # only channel 0 is the filament mask.  Slicing here rather than
+            # assuming one channel keeps spine and non-spine checkpoints on the
+            # same inference path.
+            logits = logits[:, :1]
             probs += torch.sigmoid(_dihedral_inverse(logits, k).float())
         probs /= tta
 

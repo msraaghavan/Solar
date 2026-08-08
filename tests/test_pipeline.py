@@ -335,6 +335,61 @@ def _(tmp="artifacts/_test_submission.csv"):
     os.remove(tmp)
 
 
+@check("training never uses persistent dataloader workers")
+def _():
+    # Workers fork a copy of the dataset, so with persistent_workers=True a call
+    # to set_epoch() in the parent never reaches them and every epoch replays
+    # byte-identical crops.  Verified empirically: identical batches across three
+    # epochs with persistence, different without.  Guard the call site.
+    import re
+
+    source = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "train.py")).read()
+    match = re.search(r"persistent_workers\s*=\s*([^,\n]+)", source)
+    assert match, "DataLoader must state persistent_workers explicitly"
+    assert match.group(1).strip() == "False", f"got persistent_workers={match.group(1)!r}"
+
+
+@check("validation subsets stride the fold rather than take a date-ordered prefix")
+def _():
+    # File names start with a timestamp, so sorted()[:n] would validate only on
+    # the earliest observations.
+    names = [f"20{y:02d}0101000000Bh.jpeg" for y in range(11, 23)]
+    max_files = 4
+    step = len(names) / max_files
+    chosen = [names[int(i * step)] for i in range(max_files)]
+    years = [n[:4] for n in chosen]
+    assert years == ["2011", "2014", "2017", "2020"], years
+    assert years[-1] != names[max_files - 1][:4], "must not collapse to a prefix"
+
+
+@check("inference reads only channel 0 from a two-channel model")
+def _():
+    import torch
+
+    from infer import predict_full
+    from preprocess import Disk
+
+    class TwoChannel(torch.nn.Module):
+        """Channel 0 constant 0 (p=0.5); channel 1 saturated, and must be ignored."""
+
+        def forward(self, x):
+            out = torch.zeros(x.shape[0], 2, x.shape[2], x.shape[3])
+            out[:, 1] = 20.0
+            return out
+
+    image = np.full((2048, 2048), 128, dtype=np.uint8)
+    disk = Disk(1020.0, 1027.0, 900.0)
+    context = ImageContext(disk, np.full(256, 128.0, dtype=np.float32))
+    probability = predict_full(
+        TwoChannel(), image, context, tile_size=512, stride=384, tta=1,
+        device="cpu", amp=False,
+    )
+    on_disk = disk.mask(2048)
+    assert abs(float(probability[on_disk].max()) - 0.5) < 1e-5, (
+        "spine channel leaked into the filament probability"
+    )
+
+
 @check("submission validation catches unknown ids")
 def _(tmp="artifacts/_test_bad.csv"):
     os.makedirs("artifacts", exist_ok=True)

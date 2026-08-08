@@ -65,8 +65,11 @@ def main() -> None:
     print(f"loaded {args.checkpoint} (encoder {encoder}, epoch {checkpoint.get('epoch')})", flush=True)
 
     file_names = sorted({s.file_name for s in val_samples})
-    if args.max_files:
-        file_names = file_names[: args.max_files]
+    if args.max_files and args.max_files < len(file_names):
+        # Stride, never a prefix: names sort by timestamp, so a prefix would
+        # restrict evaluation to the earliest observations.
+        step = len(file_names) / args.max_files
+        file_names = [file_names[int(i * step)] for i in range(args.max_files)]
 
     # --- inference over the validation fold ---
     t0 = time.time()

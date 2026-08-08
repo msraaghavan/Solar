@@ -27,8 +27,22 @@ def masked_bce(
     target: torch.Tensor,
     weight: torch.Tensor,
     pos_weight: float = 4.0,
+    smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """BCE restricted to on-disk pixels, with positives up-weighted."""
+    """BCE restricted to on-disk pixels, with positives up-weighted.
+
+    ``smoothing`` shrinks the positive target from 1 towards ``1 - smoothing``
+    and leaves negatives at 0.  The asymmetry is deliberate.  Annotator
+    disagreement is overwhelmingly about *which faint structures count as a
+    filament* rather than about the quiet Sun, and negatives outnumber positives
+    roughly 280:1, so lifting the negative target even slightly would swamp the
+    objective.  Capping the positive target instead removes the incentive to
+    drive one annotator's marks to probability 1 - which is what the training
+    curves show happening as PQ falls away.
+    """
+    if smoothing > 0.0:
+        target = target * (1.0 - smoothing)
+
     loss = F.binary_cross_entropy_with_logits(
         logits,
         target,
@@ -67,11 +81,13 @@ class FilamentLoss(nn.Module):
         dice_weight: float = 0.5,
         aux_weights: tuple[float, ...] = (0.4, 0.2),
         spine_weight: float = 0.0,
+        smoothing: float = 0.0,
     ):
         super().__init__()
         self.pos_weight = pos_weight
         self.dice_weight = dice_weight
         self.aux_weights = aux_weights
+        self.smoothing = smoothing
         # Weight on the auxiliary spine channel.  Kept well below 1: the spine
         # is a means of shaping the representation - teaching the network that a
         # filament is one elongated object with an axis, unlike a sunspot - not
@@ -82,12 +98,12 @@ class FilamentLoss(nn.Module):
         self, logits: torch.Tensor, target: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
         """Loss over channel 0, plus the spine channel when both provide one."""
-        loss = masked_bce(logits[:, :1], target[:, :1], weight, self.pos_weight) + (
-            self.dice_weight * soft_dice(logits[:, :1], target[:, :1], weight)
-        )
+        loss = masked_bce(
+            logits[:, :1], target[:, :1], weight, self.pos_weight, self.smoothing
+        ) + self.dice_weight * soft_dice(logits[:, :1], target[:, :1], weight)
         if self.spine_weight > 0 and logits.shape[1] > 1 and target.shape[1] > 1:
             spine = masked_bce(
-                logits[:, 1:2], target[:, 1:2], weight, self.pos_weight
+                logits[:, 1:2], target[:, 1:2], weight, self.pos_weight, self.smoothing
             ) + self.dice_weight * soft_dice(logits[:, 1:2], target[:, 1:2], weight)
             loss = loss + self.spine_weight * spine
         return loss

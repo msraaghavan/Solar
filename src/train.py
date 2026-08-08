@@ -80,9 +80,14 @@ def validate(
     for sample in samples:
         by_file.setdefault(sample.file_name, []).append(sample)
 
+    # File names begin with a timestamp, so sorting them orders by date and
+    # taking a prefix would validate exclusively on the earliest observations
+    # (all of 2011).  Stride through instead, so the subset spans the full
+    # 2011-2022 range and every GONG site.
     file_names = sorted(by_file)
-    if max_files is not None:
-        file_names = file_names[:max_files]
+    if max_files is not None and 0 < max_files < len(file_names):
+        step = len(file_names) / max_files
+        file_names = [file_names[int(i * step)] for i in range(max_files)]
 
     results = []
     # Probability statistics are logged alongside PQ because a score of zero is
@@ -136,6 +141,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--pos-weight", type=float, default=4.0)
     parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="cap the positive target at 1-eps; counters memorising noisy labels")
     parser.add_argument("--spine-weight", type=float, default=0.0,
                         help="auxiliary spine head weight; 0 disables the head entirely")
     parser.add_argument("--workers", type=int, default=4)
@@ -193,7 +200,13 @@ def main() -> None:
         num_workers=args.workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=args.workers > 0,
+        # persistent_workers MUST stay off.  Worker processes fork a copy of the
+        # dataset when they start, so with persistence they never observe
+        # set_epoch() and every epoch replays byte-identical crops with identical
+        # augmentation - which silently turns "30 epochs of fresh samples" into
+        # "one epoch repeated 30 times" and drives severe overfitting.  Respawning
+        # workers each epoch costs a couple of seconds against a ~230 s epoch.
+        persistent_workers=False,
     )
 
     model = FilamentNet(
@@ -206,6 +219,7 @@ def main() -> None:
         pos_weight=args.pos_weight,
         dice_weight=args.dice_weight,
         spine_weight=args.spine_weight,
+        smoothing=args.label_smoothing,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay

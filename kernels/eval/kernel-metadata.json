@@ -9,8 +9,15 @@
   "enable_tpu": false,
   "enable_internet": false,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": ["raaghavanms/filament-src", "raaghavanms/filament-cache"],
-  "competition_sources": ["competitions/filament-segmentation-2026"],
-  "kernel_sources": ["raaghavanms/filament-b4-f0"],
+  "dataset_sources": [
+    "raaghavanms/filament-src",
+    "raaghavanms/filament-cache"
+  ],
+  "competition_sources": [
+    "competitions/filament-segmentation-2026"
+  ],
+  "kernel_sources": [
+    "raaghavanms/filament-b0-f0"
+  ],
   "model_sources": []
 }

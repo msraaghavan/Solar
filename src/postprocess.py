@@ -149,10 +149,22 @@ def score_config(
     ground_truth: dict[str, list[dict]],
     config: PostprocessConfig,
 ) -> dict:
-    """Evaluate one configuration over a set of probability maps."""
+    """Evaluate one configuration over a set of probability maps.
+
+    An observation read by three annotators appears three times, sharing one
+    probability map.  Instance extraction depends only on that map, so it is
+    computed once per distinct map and reused - which removes about 40% of the
+    work from a tuning sweep that would otherwise repeat connected components
+    on the same 2048x2048 array for every reading.
+    """
     results = []
+    cache: dict[int, list[dict]] = {}
     for image_id, probability, disk_mask in predictions:
-        instances = extract_instances(probability, config, disk_mask)
+        key = id(probability)
+        instances = cache.get(key)
+        if instances is None:
+            instances = extract_instances(probability, config, disk_mask)
+            cache[key] = instances
         results.append(evaluate_image(image_id, ground_truth[image_id], instances))
     return evaluate(results)
 
