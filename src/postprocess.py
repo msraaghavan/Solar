@@ -170,11 +170,16 @@ def tune(
     every evaluation is a pass over the whole validation fold - and the axes are
     close enough to separable that coordinate ascent recovers most of the gain.
     """
+    # The seed grid reaches well below 0.5 on purpose.  The marginal-emission
+    # analysis says a candidate pays whenever its hit probability exceeds
+    # ~0.5*PQ/SQ - about 0.27 at the levels measured here - so the optimum is
+    # expected to sit at a threshold that looks recklessly permissive by the
+    # standards of a pixel-overlap metric.
     grids: dict[str, Iterable] = {
-        "seed_threshold": (0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7),
-        "mask_threshold": (0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5),
-        "min_area": (0, 50, 100, 150, 250, 400, 600),
-        "min_seed_area": (0, 10, 20, 50, 100),
+        "seed_threshold": (0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7),
+        "mask_threshold": (0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5),
+        "min_area": (0, 30, 60, 100, 150, 250, 400, 600),
+        "min_seed_area": (0, 5, 10, 20, 50, 100),
         "close_radius": (0, 2, 4, 6),
         "dilate_radius": (0, 1, 2, 3, 5),
         "open_radius": (0, 1, 2),

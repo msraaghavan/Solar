@@ -136,6 +136,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--pos-weight", type=float, default=4.0)
     parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--spine-weight", type=float, default=0.0,
+                        help="auxiliary spine head weight; 0 disables the head entirely")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--val-every", type=int, default=5)
     parser.add_argument("--val-files", type=int, default=40)
@@ -182,6 +184,7 @@ def main() -> None:
         tile_size=args.tile_size,
         tiles_per_sample=args.tiles_per_sample,
         augment=True,
+        with_spine=args.spine_weight > 0,
     )
     loader = DataLoader(
         dataset,
@@ -194,10 +197,16 @@ def main() -> None:
     )
 
     model = FilamentNet(
-        encoder_name=args.encoder, pretrained=not args.no_pretrained
+        encoder_name=args.encoder,
+        pretrained=not args.no_pretrained,
+        out_channels=2 if args.spine_weight > 0 else 1,
     ).to(args.device)
     ema = EMA(model)
-    criterion = FilamentLoss(pos_weight=args.pos_weight, dice_weight=args.dice_weight)
+    criterion = FilamentLoss(
+        pos_weight=args.pos_weight,
+        dice_weight=args.dice_weight,
+        spine_weight=args.spine_weight,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )

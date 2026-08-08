@@ -27,7 +27,7 @@ import torch
 from pycocotools import mask as mask_utils
 from torch.utils.data import Dataset
 
-from data import ImageContext, Sample
+from data import ImageContext, Sample, rasterise_spines
 
 IMAGE_SIZE = 2048
 
@@ -50,6 +50,7 @@ class FilamentTiles(Dataset):
         positive_fraction: float = 0.75,
         augment: bool = True,
         seed: int = 0,
+        with_spine: bool = False,
     ):
         self.samples = list(samples)
         self.image_dir = image_dir
@@ -59,6 +60,7 @@ class FilamentTiles(Dataset):
         self.positive_fraction = positive_fraction
         self.augment = augment
         self.seed = seed
+        self.with_spine = with_spine
         self.epoch = 0
 
     def __len__(self) -> int:
@@ -90,7 +92,13 @@ class FilamentTiles(Dataset):
 
         y0, x0 = self._choose_origin(rng, sample, context)
         features = context.tile_features(image, y0, x0, self.tile_size)
-        target = mask[y0 : y0 + self.tile_size, x0 : x0 + self.tile_size].astype(np.float32)
+        target = mask[y0 : y0 + self.tile_size, x0 : x0 + self.tile_size].astype(np.float32)[None]
+
+        if self.with_spine:
+            spine = rasterise_spines(sample.spines)
+            target = np.concatenate(
+                [target, spine[y0 : y0 + self.tile_size, x0 : x0 + self.tile_size].astype(np.float32)[None]]
+            )
 
         # Only on-disk pixels carry information; off-disk is trivially negative
         # and would otherwise dominate tiles that straddle the limb.  Taken from
@@ -102,7 +110,7 @@ class FilamentTiles(Dataset):
 
         return (
             torch.from_numpy(np.ascontiguousarray(features)),
-            torch.from_numpy(np.ascontiguousarray(target))[None],
+            torch.from_numpy(np.ascontiguousarray(target)),
             torch.from_numpy(np.ascontiguousarray(weight))[None],
         )
 
@@ -143,11 +151,11 @@ class FilamentTiles(Dataset):
         k = int(rng.integers(4))
         if k:
             features = np.rot90(features, k, axes=(1, 2))
-            target = np.rot90(target, k)
+            target = np.rot90(target, k, axes=(1, 2))
             weight = np.rot90(weight, k)
         if rng.random() < 0.5:
             features = features[:, :, ::-1]
-            target = target[:, ::-1]
+            target = target[:, :, ::-1]
             weight = weight[:, ::-1]
 
         features = features.copy()

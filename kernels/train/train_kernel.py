@@ -149,6 +149,32 @@ for line in process.stdout:
 code = process.wait()
 
 print(f"\ntraining exited with code {code} after {(time.time() - t0) / 60:.1f} min", flush=True)
-print("outputs:", sorted(os.listdir(WORK)), flush=True)
 if code != 0:
+    print("outputs:", sorted(os.listdir(WORK)), flush=True)
     raise SystemExit(code)
+
+# Fit the post-processing decision parameters in the same session.  The
+# probability maps for a whole validation fold are ~2.3 GB, so tuning here
+# avoids shipping them anywhere, and the tuned config lands next to the
+# checkpoint that produced it.
+checkpoint = f"{WORK}/fold{FOLD}_best.pt"
+if os.path.exists(checkpoint):
+    print("\n--- fitting post-processing against PQ ---", flush=True)
+    evaluate = subprocess.Popen(
+        [
+            sys.executable, f"{SRC}/evaluate_fold.py",
+            "--data-root", DATA_ROOT,
+            "--context-cache", context_cache,
+            "--checkpoint", checkpoint,
+            "--fold", str(FOLD),
+            "--tta", os.environ.get("EVAL_TTA", "4"),
+            "--out", f"{WORK}/fold{FOLD}_tuned.json",
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        env={**os.environ, "PYTHONPATH": SRC, "PYTHONUNBUFFERED": "1"},
+    )
+    for line in evaluate.stdout:
+        print(line.rstrip(), flush=True)
+    print(f"evaluation exited {evaluate.wait()}", flush=True)
+
+print("outputs:", sorted(os.listdir(WORK)), flush=True)

@@ -54,7 +54,12 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     encoder = checkpoint["args"]["encoder"]
-    model = FilamentNet(encoder_name=encoder, pretrained=False).to(args.device)
+    # A checkpoint trained with the auxiliary spine head has two output
+    # channels; only channel 0 (the filament mask) is used at inference.
+    out_channels = checkpoint["model"]["head.weight"].shape[0]
+    model = FilamentNet(
+        encoder_name=encoder, pretrained=False, out_channels=out_channels
+    ).to(args.device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     print(f"loaded {args.checkpoint} (encoder {encoder}, epoch {checkpoint.get('epoch')})", flush=True)

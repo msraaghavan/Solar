@@ -66,18 +66,31 @@ class FilamentLoss(nn.Module):
         pos_weight: float = 4.0,
         dice_weight: float = 0.5,
         aux_weights: tuple[float, ...] = (0.4, 0.2),
+        spine_weight: float = 0.0,
     ):
         super().__init__()
         self.pos_weight = pos_weight
         self.dice_weight = dice_weight
         self.aux_weights = aux_weights
+        # Weight on the auxiliary spine channel.  Kept well below 1: the spine
+        # is a means of shaping the representation - teaching the network that a
+        # filament is one elongated object with an axis, unlike a sunspot - not
+        # something the metric ever asks for.
+        self.spine_weight = spine_weight
 
     def _single(
         self, logits: torch.Tensor, target: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
-        return masked_bce(logits, target, weight, self.pos_weight) + (
-            self.dice_weight * soft_dice(logits, target, weight)
+        """Loss over channel 0, plus the spine channel when both provide one."""
+        loss = masked_bce(logits[:, :1], target[:, :1], weight, self.pos_weight) + (
+            self.dice_weight * soft_dice(logits[:, :1], target[:, :1], weight)
         )
+        if self.spine_weight > 0 and logits.shape[1] > 1 and target.shape[1] > 1:
+            spine = masked_bce(
+                logits[:, 1:2], target[:, 1:2], weight, self.pos_weight
+            ) + self.dice_weight * soft_dice(logits[:, 1:2], target[:, 1:2], weight)
+            loss = loss + self.spine_weight * spine
+        return loss
 
     def forward(
         self,

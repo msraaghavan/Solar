@@ -77,6 +77,7 @@ class FilamentNet(nn.Module):
         pretrained: bool = True,
         decoder_channels: tuple[int, ...] = (256, 128, 64, 32, 16),
         deep_supervision: bool = True,
+        out_channels: int = 1,
     ):
         super().__init__()
         import timm
@@ -104,10 +105,17 @@ class FilamentNet(nn.Module):
             in_ch = out_ch
         self.blocks = nn.ModuleList(blocks)
 
-        self.head = nn.Conv2d(decoder_channels[-1], 1, 1)
+        # Channel 0 is always the filament mask.  A second channel, when
+        # enabled, predicts the filament spine as an auxiliary task; it is never
+        # used at inference, only to shape the representation during training.
+        self.out_channels = out_channels
+        self.head = nn.Conv2d(decoder_channels[-1], out_channels, 1)
         if deep_supervision:
             self.aux_heads = nn.ModuleList(
-                [nn.Conv2d(decoder_channels[-2], 1, 1), nn.Conv2d(decoder_channels[-3], 1, 1)]
+                [
+                    nn.Conv2d(decoder_channels[-2], out_channels, 1),
+                    nn.Conv2d(decoder_channels[-3], out_channels, 1),
+                ]
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
