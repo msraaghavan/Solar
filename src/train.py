@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import json
 import os
 import time
@@ -122,6 +123,94 @@ def validate(
     report["diag_prob_max"] = float(np.mean(peaks)) if peaks else 0.0
     report["diag_instances_per_image"] = float(np.mean(counts)) if counts else 0.0
     return report
+
+
+def preflight(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    loader: DataLoader,
+    val_samples: list[Sample],
+    image_dir: str,
+    contexts: dict[str, ImageContext],
+    device: str,
+    epochs: int,
+) -> None:
+    """Exercise every path that can fail silently, before committing hours to a run.
+
+    Unit tests run on synthetic fixtures and cannot see the failures that
+    actually cost us runs: EfficientNet-B4 overflowing fp16 under autocast, a
+    frozen dataloader epoch, a corrupted probability map.  Those need the real
+    model, real weights, real half precision and real data - which is exactly
+    what this does, once, in about a minute.
+
+    It also times one step and one full-disk inference so the run's total cost is
+    known up front rather than discovered three hours later.
+    """
+    print("--- preflight ---", flush=True)
+    amp = device.startswith("cuda")
+
+    # 1. One real training step, in the same precision the run will use.
+    t0 = time.time()
+    features, target, weight = next(iter(loader))
+    load_time = time.time() - t0
+    features, target, weight = (
+        features.to(device), target.to(device), weight.to(device)
+    )
+    if not torch.isfinite(features).all():
+        raise RuntimeError("preflight: non-finite features from the dataloader")
+
+    model.train()
+    t0 = time.time()
+    with torch.autocast(device_type=device.split(":")[0], enabled=amp):
+        loss = criterion(model(features), target, weight)
+    loss.backward()
+    step_time = time.time() - t0
+    if not math.isfinite(loss.item()):
+        raise RuntimeError(f"preflight: non-finite loss {loss.item()}")
+
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        raise RuntimeError("preflight: no gradients reached the parameters")
+    if not all(torch.isfinite(g).all() for g in grads):
+        raise RuntimeError(
+            "preflight: non-finite gradients in half precision - this encoder "
+            "overflows fp16 and would train with silently skipped steps"
+        )
+    model.zero_grad(set_to_none=True)
+
+    # 2. One real full-disk inference, which is where the B4 NaN surfaced.
+    file_name = sorted({s.file_name for s in val_samples})[0]
+    image = cv2.imread(os.path.join(image_dir, file_name), cv2.IMREAD_GRAYSCALE)
+    t0 = time.time()
+    probability = predict_full(model, image, contexts[file_name], tta=1, device=device)
+    infer_time = time.time() - t0
+    instances = extract_instances(
+        probability, PostprocessConfig(), disk_mask_for(contexts[file_name])
+    )
+
+    steps = len(loader)
+    epoch_estimate = steps * step_time
+    print(
+        f"  batch load {load_time:.2f}s | train step {step_time:.3f}s | "
+        f"full-disk infer {infer_time:.1f}s",
+        flush=True,
+    )
+    print(
+        f"  probability in [{probability.min():.3f}, {probability.max():.3f}], "
+        f"{len(instances)} instances on {file_name}",
+        flush=True,
+    )
+    print(
+        f"  {steps} steps/epoch -> ~{epoch_estimate / 60:.1f} min/epoch, "
+        f"~{epochs * epoch_estimate / 3600:.1f} h for {epochs} epochs",
+        flush=True,
+    )
+    if len(instances) > 200:
+        raise RuntimeError(
+            f"preflight: {len(instances)} instances from an untrained model suggests "
+            "a corrupted probability map"
+        )
+    print("  preflight OK", flush=True)
 
 
 def main() -> None:
@@ -234,12 +323,16 @@ def main() -> None:
     )
     scaler = torch.amp.GradScaler(enabled=args.device.startswith("cuda"))
 
+    preflight(
+        model, criterion, loader, val_samples, train_dir, contexts, args.device, args.epochs
+    )
+
     best_pq = -1.0
     history = []
     for epoch in range(args.epochs):
         dataset.set_epoch(epoch)
         model.train()
-        running, seen, t0 = 0.0, 0, time.time()
+        running, seen, skipped, t0 = 0.0, 0, 0, time.time()
 
         for step, (features, target, weight) in enumerate(loader):
             if args.max_steps and step >= args.max_steps:
@@ -257,18 +350,36 @@ def main() -> None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            # A skipped step is invisible unless you look for it: GradScaler
+            # silently drops the update when gradients are non-finite and lowers
+            # the loss scale.  EfficientNet-B4 overflows fp16 on a T4, so a run
+            # can be badly undertrained while its loss curve looks perfectly
+            # healthy - which is exactly what the B4 run may have suffered.
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            if scaler.get_scale() < scale_before:
+                skipped += 1
             scheduler.step()
             ema.update(model)
 
-            running += loss.item() * features.size(0)
+            # A non-finite loss is not survivable and must not be averaged away
+            # into a plausible-looking epoch mean.  Silent corruption is the
+            # failure mode that cost us the B4 run.
+            value = loss.item()
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"non-finite loss at epoch {epoch + 1} step {step}: {value}"
+                )
+            running += value * features.size(0)
             seen += features.size(0)
 
         message = (
             f"epoch {epoch + 1:3d}/{args.epochs}  loss {running / max(seen, 1):.4f}  "
             f"lr {scheduler.get_last_lr()[0]:.2e}  {time.time() - t0:.0f}s"
         )
+        if skipped:
+            message += f"  AMP-SKIPPED {skipped} steps"
 
         if (epoch + 1) % args.val_every == 0 or epoch == args.epochs - 1:
             report = validate(

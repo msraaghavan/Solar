@@ -107,6 +107,13 @@ class FilamentTiles(Dataset):
         if self.augment:
             features, target, weight = self._augment(rng, features, target, weight)
 
+        # Cheap invariants at the boundary into the network.  Unit tests on
+        # synthetic fixtures cannot see a corrupt real sample; these can.
+        if not np.isfinite(features).all():
+            raise ValueError(f"non-finite features for {sample.image_id} at ({y0},{x0})")
+        if target.min() < 0.0 or target.max() > 1.0:
+            raise ValueError(f"target outside [0,1] for {sample.image_id}")
+
         return (
             torch.from_numpy(np.ascontiguousarray(features)),
             torch.from_numpy(np.ascontiguousarray(target)),

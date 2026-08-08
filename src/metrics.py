@@ -211,9 +211,13 @@ def evaluate(
     matched_ious = [i for r in results for i in r.matched_ious]
     dices = [dice_from_iou(i) for i in matched_ious]
 
+    pq_micro = iou_sum / denom if denom > 0 else 0.0
+    if not (0.0 <= pq_micro <= 1.0 + 1e-9):
+        raise ValueError(f"PQ outside [0,1]: {pq_micro} (tp={tp} fp={fp} fn={fn})")
+
     return {
         # Primary leaderboard metric, both plausible aggregations.
-        "pq_micro": iou_sum / denom if denom > 0 else 0.0,
+        "pq_micro": pq_micro,
         "pq_macro": float(np.mean([r.pq for r in results])) if results else 0.0,
         # Panoptic decomposition: PQ = SQ * RQ.
         "sq": iou_sum / tp if tp else 0.0,

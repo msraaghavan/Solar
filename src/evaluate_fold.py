@@ -99,11 +99,31 @@ def main() -> None:
     )
 
     # --- tune the decision parameters against PQ ---
-    print("\n--- tuning post-processing ---", flush=True)
-    best, report = tune(predictions, ground_truth)
+    #
+    # Split first.  The tuner searches ~90 configurations, so scoring the winner
+    # on the same readings it was chosen from reports a selection-biased number.
+    # Tuning uses one half and the headline figure comes from the other, which
+    # the search never saw.  The split interleaves rather than cutting the list
+    # in two, because file names sort by date.
+    tune_set = [p for i, p in enumerate(predictions) if i % 2 == 0]
+    held_out = [p for i, p in enumerate(predictions) if i % 2 == 1]
+    print(
+        f"\n--- tuning post-processing on {len(tune_set)} readings, "
+        f"reporting on {len(held_out)} held out ---",
+        flush=True,
+    )
+    best, in_sample = tune(tune_set, ground_truth)
+    report = score_config(held_out, ground_truth, best)
 
     print("\n--- tuned configuration ---")
     print(json.dumps(best.as_dict(), indent=2))
+    print(
+        f"\nPQ on the tuning half   {in_sample['pq_micro']:.4f}  (selection-biased)"
+    )
+    print(f"PQ on the held-out half {report['pq_micro']:.4f}  <- honest estimate")
+    print(
+        f"selection optimism      {in_sample['pq_micro'] - report['pq_micro']:+.4f}\n"
+    )
     print(format_report(report))
     print(
         f"\nmarginal-emission threshold implied by this operating point: "

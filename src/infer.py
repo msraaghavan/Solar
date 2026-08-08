@@ -121,6 +121,10 @@ def predict_full(
     )
     if not np.isfinite(probability).all():
         raise RuntimeError("non-finite probability map survived the fp32 fallback")
+    if probability.min() < 0.0 or probability.max() > 1.0 + 1e-5:
+        raise RuntimeError(
+            f"probability map outside [0,1]: [{probability.min()}, {probability.max()}]"
+        )
     return probability
 
 

@@ -65,11 +65,17 @@ class PostprocessConfig:
     extent.  Setting them equal recovers plain single-threshold behaviour.
     """
 
-    seed_threshold: float = 0.45
-    mask_threshold: float = 0.30
-    min_area: int = 150
+    # Defaults are the configuration fitted against PQ on fold 0 (PQ 0.4062),
+    # not round numbers.  This matters beyond convenience: training validates
+    # with these values, so an arbitrary default would both understate PQ and -
+    # far worse - select the best checkpoint at the wrong operating point.  The
+    # fitted point is markedly non-obvious: a *high* bar to admit a component
+    # (0.70) combined with a *low* one for its extent (0.35).
+    seed_threshold: float = 0.70
+    mask_threshold: float = 0.35
+    min_area: int = 400
     min_seed_area: int = 20
-    close_radius: int = 0
+    close_radius: int = 2
     open_radius: int = 0
     dilate_radius: int = 0
     fill_holes: bool = True

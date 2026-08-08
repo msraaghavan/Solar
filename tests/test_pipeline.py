@@ -263,7 +263,9 @@ def hysteresis_fixture():
 @check("hysteresis beats every single threshold on the same fixture")
 def _():
     p = hysteresis_fixture()
-    base = dict(min_area=10, min_seed_area=1, dilate_radius=0)
+    # Pin morphology off: this test is about threshold semantics, and the
+    # fitted default close_radius=2 would bridge the gap by itself.
+    base = dict(min_area=10, min_seed_area=1, dilate_radius=0, close_radius=0)
     areas = lambda inst: sorted(int(mask_utils.area(x)) for x in inst)  # noqa: E731
 
     high = extract_instances(p, PostprocessConfig(seed_threshold=0.45, mask_threshold=0.45, **base))
@@ -281,11 +283,11 @@ def _():
     disk = np.zeros((200, 200), dtype=np.uint8)
     disk[:, :90] = 1
     plain = extract_instances(
-        p, PostprocessConfig(seed_threshold=0.45, mask_threshold=0.45, min_area=10, min_seed_area=1), disk
+        p, PostprocessConfig(seed_threshold=0.45, mask_threshold=0.45, min_area=10, min_seed_area=1, close_radius=0), disk
     )
     grown = extract_instances(
         p,
-        PostprocessConfig(seed_threshold=0.45, mask_threshold=0.45, min_area=10, min_seed_area=1, dilate_radius=3),
+        PostprocessConfig(seed_threshold=0.45, mask_threshold=0.45, min_area=10, min_seed_area=1, dilate_radius=3, close_radius=0),
         disk,
     )
     assert mask_utils.area(grown[0]) > mask_utils.area(plain[0])
@@ -306,7 +308,7 @@ def _():
     p[10:30, 10:30] = 0.9
     p[60:90, 60:90] = 0.9
     truth = [rle(box(128, 10, 30, 10, 30)), rle(box(128, 60, 90, 60, 90))]
-    got = extract_instances(p, PostprocessConfig(seed_threshold=0.5, mask_threshold=0.5, min_area=10, min_seed_area=1))
+    got = extract_instances(p, PostprocessConfig(seed_threshold=0.5, mask_threshold=0.5, min_area=10, min_seed_area=1, close_radius=0))
     assert abs(metrics.evaluate_image("cc", truth, got).pq - 1.0) < 1e-9
 
 
@@ -388,6 +390,16 @@ def _():
     assert abs(float(probability[on_disk].max()) - 0.5) < 1e-5, (
         "spine channel leaked into the filament probability"
     )
+
+
+@check("post-processing defaults match the configuration fitted against PQ")
+def _():
+    # Training validates with these defaults, so a stale value would select the
+    # best checkpoint at the wrong operating point.  Fitted on fold 0 -> PQ 0.4062.
+    c = PostprocessConfig()
+    assert (c.seed_threshold, c.mask_threshold) == (0.70, 0.35), c
+    assert (c.min_area, c.min_seed_area, c.close_radius) == (400, 20, 2), c
+    assert c.mask_threshold < c.seed_threshold, "hysteresis needs a looser extent than seed"
 
 
 @check("submission validation catches unknown ids")
