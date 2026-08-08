@@ -1,0 +1,294 @@
+"""Train one cross-validation fold.
+
+Validation is deliberately expensive: rather than tracking a tile-level Dice
+that correlates only loosely with the leaderboard, every few epochs the model
+runs full-disk inference on a subset of held-out observations and is scored with
+the real Panoptic Quality implementation, including instance extraction.  That
+keeps model selection aligned with the thing being optimised.
+
+Where an observation carries several independent annotations, PQ is computed
+against each annotator separately and averaged.  A single fused "consensus"
+target would flatter the model, since the test ground truth is itself the work
+of individual annotators who agree with each other only moderately.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import time
+
+import cv2
+import numpy as np
+import torch
+from pycocotools import mask as mask_utils
+from torch.utils.data import DataLoader
+
+from data import ImageContext, Sample, build_contexts, load_samples, make_folds, save_contexts, load_contexts
+from dataset_torch import FilamentTiles
+from infer import disk_mask_for, predict_full
+from losses import FilamentLoss
+from metrics import evaluate, evaluate_image, format_report
+from model import FilamentNet
+from postprocess import PostprocessConfig, extract_instances
+from preprocess import Disk
+
+
+class EMA:
+    """Exponential moving average of weights, with warm-up bias correction.
+
+    The shadow starts as a copy of the *randomly initialised* model, so a fixed
+    decay of 0.999 leaves 0.999^n of that noise behind after n steps - still 40%
+    after a 900-step run, which is enough to pin the output at a constant and
+    make early validation read zero.  Ramping the decay in as
+    ``min(decay, (1 + n) / (10 + n))`` makes the first updates track the live
+    weights almost exactly and converges to ``decay`` once training is underway.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.steps = 0
+        self.shadow = copy.deepcopy(model).eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.steps += 1
+        decay = min(self.decay, (1.0 + self.steps) / (10.0 + self.steps))
+        for shadow, live in zip(self.shadow.state_dict().values(), model.state_dict().values()):
+            if shadow.dtype.is_floating_point:
+                shadow.mul_(decay).add_(live.detach(), alpha=1.0 - decay)
+            else:
+                shadow.copy_(live)
+
+
+def validate(
+    model: torch.nn.Module,
+    samples: list[Sample],
+    image_dir: str,
+    contexts: dict[str, ImageContext],
+    config: PostprocessConfig,
+    device: str,
+    tta: int = 1,
+    max_files: int | None = None,
+) -> dict:
+    """Full-disk PQ over held-out observations, averaged across annotators."""
+    by_file: dict[str, list[Sample]] = {}
+    for sample in samples:
+        by_file.setdefault(sample.file_name, []).append(sample)
+
+    file_names = sorted(by_file)
+    if max_files is not None:
+        file_names = file_names[:max_files]
+
+    results = []
+    # Probability statistics are logged alongside PQ because a score of zero is
+    # otherwise ambiguous: a collapsed model that emits a constant and a model
+    # that simply finds nothing above threshold look identical in the metric,
+    # but demand completely different fixes.
+    inside, outside, peaks, counts = [], [], [], []
+
+    for file_name in file_names:
+        image = cv2.imread(os.path.join(image_dir, file_name), cv2.IMREAD_GRAYSCALE)
+        context = contexts[file_name]
+        probability = predict_full(
+            model, image, context, tta=tta, device=device
+        )
+        on_disk = disk_mask_for(context)
+        instances = extract_instances(probability, config, on_disk)
+        counts.append(len(instances))
+        peaks.append(float(probability[on_disk].max()))
+
+        for sample in by_file[file_name]:
+            results.append(
+                evaluate_image(sample.image_id, sample.instances, instances)
+            )
+            if sample.instances:
+                truth = mask_utils.decode(sample.semantic_rle).astype(bool)
+                inside.append(float(probability[truth].mean()))
+                outside.append(float(probability[on_disk & ~truth].mean()))
+
+    report = evaluate(results)
+    report["diag_prob_inside_gt"] = float(np.mean(inside)) if inside else 0.0
+    report["diag_prob_outside_gt"] = float(np.mean(outside)) if outside else 0.0
+    report["diag_prob_max"] = float(np.mean(peaks)) if peaks else 0.0
+    report["diag_instances_per_image"] = float(np.mean(counts)) if counts else 0.0
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", default="data/MAGFiLO_1.0_Kaggle_2026")
+    parser.add_argument("--disk-cache", default="artifacts/disk_cache.json")
+    parser.add_argument("--context-cache", default="artifacts/contexts.npz")
+    parser.add_argument("--out-dir", default="artifacts")
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--n-folds", type=int, default=5)
+    parser.add_argument("--encoder", default="tf_efficientnet_b4")
+    parser.add_argument("--tile-size", type=int, default=512)
+    parser.add_argument("--tiles-per-sample", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--pos-weight", type=float, default=4.0)
+    parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--val-every", type=int, default=5)
+    parser.add_argument("--val-files", type=int, default=40)
+    parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--max-steps", type=int, default=0, help="debug: cap steps/epoch")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    torch.manual_seed(1234 + args.fold)
+    np.random.seed(1234 + args.fold)
+
+    train_dir = os.path.join(args.data_root, "train", "train_images")
+    annotations = os.path.join(
+        args.data_root, "train", "MAGFiLO_1.0_Annotations_kaggle2026_train.json"
+    )
+
+    samples = load_samples(annotations)
+    folds = make_folds(samples, n_folds=args.n_folds)
+    train_samples = [s for s in samples if folds[s.file_name] != args.fold]
+    val_samples = [s for s in samples if folds[s.file_name] == args.fold]
+    print(
+        f"fold {args.fold}: {len(train_samples)} train / {len(val_samples)} val samples "
+        f"({len({s.file_name for s in train_samples})}/{len({s.file_name for s in val_samples})} files)",
+        flush=True,
+    )
+
+    if os.path.exists(args.context_cache):
+        contexts = load_contexts(args.context_cache)
+        print(f"loaded {len(contexts)} contexts from cache", flush=True)
+    else:
+        with open(args.disk_cache) as fh:
+            disk_cache = json.load(fh)
+        names = sorted({s.file_name for s in samples})
+        t0 = time.time()
+        contexts = build_contexts(train_dir, names, disk_cache)
+        save_contexts(contexts, args.context_cache)
+        print(f"built {len(contexts)} contexts in {time.time() - t0:.0f}s", flush=True)
+
+    dataset = FilamentTiles(
+        train_samples,
+        train_dir,
+        contexts,
+        tile_size=args.tile_size,
+        tiles_per_sample=args.tiles_per_sample,
+        augment=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.workers,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=args.workers > 0,
+    )
+
+    model = FilamentNet(
+        encoder_name=args.encoder, pretrained=not args.no_pretrained
+    ).to(args.device)
+    ema = EMA(model)
+    criterion = FilamentLoss(pos_weight=args.pos_weight, dice_weight=args.dice_weight)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+
+    steps_per_epoch = args.max_steps or len(loader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        total_steps=args.epochs * steps_per_epoch,
+        pct_start=0.1,
+    )
+    scaler = torch.amp.GradScaler(enabled=args.device.startswith("cuda"))
+
+    best_pq = -1.0
+    history = []
+    for epoch in range(args.epochs):
+        dataset.set_epoch(epoch)
+        model.train()
+        running, seen, t0 = 0.0, 0, time.time()
+
+        for step, (features, target, weight) in enumerate(loader):
+            if args.max_steps and step >= args.max_steps:
+                break
+            features = features.to(args.device, non_blocking=True)
+            target = target.to(args.device, non_blocking=True)
+            weight = weight.to(args.device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type=args.device.split(":")[0],
+                enabled=args.device.startswith("cuda"),
+            ):
+                loss = criterion(model(features), target, weight)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            ema.update(model)
+
+            running += loss.item() * features.size(0)
+            seen += features.size(0)
+
+        message = (
+            f"epoch {epoch + 1:3d}/{args.epochs}  loss {running / max(seen, 1):.4f}  "
+            f"lr {scheduler.get_last_lr()[0]:.2e}  {time.time() - t0:.0f}s"
+        )
+
+        if (epoch + 1) % args.val_every == 0 or epoch == args.epochs - 1:
+            report = validate(
+                ema.shadow,
+                val_samples,
+                train_dir,
+                contexts,
+                PostprocessConfig(),
+                args.device,
+                tta=1,
+                max_files=args.val_files,
+            )
+            message += (
+                f"  |  val PQ {report['pq_micro']:.4f} (SQ {report['sq']:.3f} "
+                f"RQ {report['rq']:.3f})  p_in {report['diag_prob_inside_gt']:.3f} "
+                f"p_out {report['diag_prob_outside_gt']:.3f} "
+                f"p_max {report['diag_prob_max']:.3f} "
+                f"inst {report['diag_instances_per_image']:.1f}"
+            )
+            history.append({"epoch": epoch + 1, **{k: v for k, v in report.items() if not isinstance(v, list)}})
+            if report["pq_micro"] > best_pq:
+                best_pq = report["pq_micro"]
+                torch.save(
+                    {
+                        "model": ema.shadow.state_dict(),
+                        "args": vars(args),
+                        "epoch": epoch + 1,
+                        "pq": best_pq,
+                    },
+                    os.path.join(args.out_dir, f"fold{args.fold}_best.pt"),
+                )
+                message += "  *saved*"
+
+        print(message, flush=True)
+
+    torch.save(
+        {"model": ema.shadow.state_dict(), "args": vars(args), "epoch": args.epochs},
+        os.path.join(args.out_dir, f"fold{args.fold}_last.pt"),
+    )
+    with open(os.path.join(args.out_dir, f"fold{args.fold}_history.json"), "w") as fh:
+        json.dump(history, fh, indent=2)
+    print(f"best val PQ {best_pq:.4f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+# Competition data: 751 MB and licensed CC BY-NC 4.0, so it is never
+# redistributed here.  Fetch it with the kaggle CLI (see README).
+data/
+
+# Generated artefacts: caches, checkpoints, probability maps, logs.
+artifacts/
+*.pt
+*.pth
+*.npz
+*.log
+
+# Staging directories built by tools/sync_src.py and tools/push_train.py.
+kernels/srcpkg/
+kernels/cachepkg/
+kernels/pulled/
+kernels/_runs/
+kernels/*/out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

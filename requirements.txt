@@ -1,0 +1,14 @@
+# Pinned to the Kaggle T4 runtime the submitted results were produced on
+# (kaggle/python image, August 2026).  Any CUDA build supporting sm_75 works;
+# note that Kaggle's default P100 accelerator is sm_60 and is NOT compatible
+# with these torch wheels - request "NvidiaTeslaT4" instead.
+torch==2.10.0
+torchvision==0.25.0
+timm==1.0.26
+numpy==2.0.2
+opencv-python-headless==4.13.0
+pycocotools==2.0.10
+scipy==1.16.3
+scikit-image==0.25.2
+pandas==2.2.3
+matplotlib==3.10.0
