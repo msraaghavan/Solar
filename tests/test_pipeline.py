@@ -11,6 +11,7 @@ that plane was rescaled.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -22,7 +23,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from pycocotools import mask as mask_utils  # noqa: E402
 
 import metrics  # noqa: E402
-from data import FEATURE_MEAN, FEATURE_STD, ImageContext, make_folds, Sample  # noqa: E402
+from data import FEATURE_MEAN, FEATURE_STD, ImageContext, make_folds, Sample, stride_split  # noqa: E402
+import postprocess  # noqa: E402
 from postprocess import PostprocessConfig, extract_instances, marginal_threshold  # noqa: E402
 from preprocess import Disk, detect_disk, flat_field, limb_profile  # noqa: E402
 from submit import rle_to_counts, validate_submission, write_submission  # noqa: E402
@@ -300,6 +302,106 @@ def _():
     p = hysteresis_fixture()
     assert extract_instances(p, PostprocessConfig(min_area=10**6)) == []
     assert extract_instances(p, PostprocessConfig(min_seed_area=10**6)) == []
+
+
+@check("the tuning split separates observations, not annotator readings")
+def _():
+    # An observation read by three annotators produces three readings.  Splitting
+    # the reading list puts them on both sides, so the tuner reports its own
+    # optimism on images it already fitted to.  Splitting observations cannot.
+    names = [f"2016092023{i:04d}Lh.jpeg" for i in range(20)]
+    readings = [n for n in names for _ in range(3)]  # every image read 3 times
+
+    tune, report = stride_split(readings)
+    assert not (tune & report), "an observation landed in both halves"
+    assert tune | report == set(names), "the split lost or invented observations"
+    assert abs(len(tune) - len(report)) <= 1, "the halves should be balanced"
+
+    naive = {r for i, r in enumerate(readings) if i % 2 == 0}
+    assert naive & {r for i, r in enumerate(readings) if i % 2 == 1}, (
+        "the reading-level split this replaced is supposed to leak; if it no "
+        "longer does, this test is not measuring what it claims"
+    )
+
+
+@check("uint8 and float probability maps extract identical instances")
+def _():
+    # Out-of-fold tuning holds all 707 training maps at once, which only fits as
+    # uint8.  Quantisation must not move a single instance boundary.
+    p = hysteresis_fixture()
+    q = np.round(p * 255).astype(np.uint8)
+    for seed, mask_t in [(0.45, 0.30), (0.8, 0.35), (0.32, 0.32), (0.95, 0.05)]:
+        config = PostprocessConfig(
+            seed_threshold=seed, mask_threshold=mask_t, min_area=10, min_seed_area=1
+        )
+        a = [rle_to_counts(x) for x in extract_instances(p, config)]
+        b = [rle_to_counts(x) for x in extract_instances(q, config)]
+        assert a == b, f"uint8 path diverged at seed={seed} mask={mask_t}"
+
+
+@check("min_seed_fraction rejects on confidence ratio, not absolute size")
+def _():
+    # A large vague blob and a small crisp one, with the same absolute seed area.
+    # min_seed_area cannot tell them apart; the fraction can.
+    p = np.zeros((200, 200), dtype=np.float32)
+    p[10:70, 10:70] = 0.40          # 3600 px, vague
+    p[10:30, 10:30] = 0.80          #  400 px of it confident -> fraction 0.11
+    p[120:140, 120:140] = 0.80      #  400 px, entirely confident -> fraction 1.0
+
+    base = dict(seed_threshold=0.7, mask_threshold=0.35, min_area=100, close_radius=0)
+    both = extract_instances(p, PostprocessConfig(min_seed_area=400, **base))
+    assert len(both) == 2, "both components clear an absolute seed area of 400"
+
+    crisp = extract_instances(
+        p, PostprocessConfig(min_seed_area=400, min_seed_fraction=0.5, **base)
+    )
+    assert len(crisp) == 1, "the ratio should drop the vague blob and keep the crisp one"
+    assert int(mask_utils.area(crisp[0])) == 400, "the surviving instance is the crisp one"
+
+    assert extract_instances(p, PostprocessConfig(min_seed_fraction=0.0, **base)) == both, (
+        "0.0 must be an exact no-op, so the fitted value decides whether it is used"
+    )
+
+
+@check("every configuration ever fitted sits strictly inside its grid")
+def _():
+    # The defaults test below only guards the *default* config.  Fitted configs
+    # live in artefacts, and a value pinned at a grid ceiling there is the same
+    # boundary artefact - it is how seed_threshold=0.70 went unnoticed across
+    # five folds, and how min_seed_fraction=0.4 was then missed in the pilot.
+    import glob
+
+    checked = 0
+    for path in glob.glob("kernels/_runs/out_*/*_tuned.json"):
+        with open(path) as fh:
+            config = json.load(fh)["config"]
+        for name, value in config.items():
+            grid = postprocess.TUNING_GRIDS.get(name)
+            if grid is None or not isinstance(value, (int, float)):
+                continue
+            assert value <= max(grid), f"{path}: {name}={value} exceeds its grid"
+            if value == max(grid):
+                raise AssertionError(
+                    f"{path}: {name}={value} was fitted at the ceiling of its grid; "
+                    f"widen the axis before trusting that configuration"
+                )
+            checked += 1
+    print(f"      ({checked} fitted values checked across artefacts)", end="")
+
+
+@check("the tuning grid brackets every fitted value on both sides")
+def _():
+    # Folds 0-2 all selected seed_threshold=0.70 when 0.70 was the largest value
+    # offered, so the search was censored and the "optimum" was a grid edge.  A
+    # value that a fold can select must never again be the ceiling of its axis.
+    fitted = PostprocessConfig()
+    for name, grid in postprocess.TUNING_GRIDS.items():
+        value = getattr(fitted, name)
+        assert value in grid, f"{name}={value} is not reachable on its own grid"
+        assert value < max(grid), (
+            f"{name}={value} sits at the grid ceiling {max(grid)}; widen the axis "
+            f"or the fitted value is a boundary artefact, not an optimum"
+        )
 
 
 @check("connected components recover disjoint instances exactly")
