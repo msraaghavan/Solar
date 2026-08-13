@@ -107,14 +107,22 @@ def match_instances(
 
 
 def fragmentation_counts(
-    ious: np.ndarray, overlap_threshold: float = 0.1
+    ious: np.ndarray, overlap_threshold: float = 0.0
 ) -> tuple[int, int]:
     """Count one-to-many (fragmentation) and many-to-one (over-merge) relations.
 
-    The rubric asks for the "distribution of one-to-many and many-to-one
-    relations".  A ground-truth segment overlapped by two or more predictions
-    above ``overlap_threshold`` counts as one fragmentation event; a prediction
-    overlapping two or more ground-truth segments counts as one over-merge.
+    The rubric scores these directly, so the definition has to be the host's
+    rather than a reasonable-looking one of our own.  Their self-evaluation
+    notebook builds ``hit_matrix = iou_matrix > 0`` for this plot - *any* overlap
+    at all, however slight - and counts a ground-truth segment as fragmented when
+    it touches two or more predictions, a prediction as over-merged when it
+    touches two or more ground-truth segments.
+
+    This used to default to 0.1, which quietly reported better fragmentation than
+    the judges will measure: a prediction clipping a neighbouring filament by a
+    few pixels is invisible at 0.1 and counts against us at 0.  The threshold
+    stays a parameter, because 0.1 remains the more informative number for
+    deciding whether a split is real, but the default now matches the rubric.
     """
     if ious.size == 0:
         return 0, 0
@@ -141,6 +149,15 @@ class ImageResult:
     fn: int
     iou_sum: float
     matched_ious: list[float] = field(default_factory=list)
+    # Best IoU achieved against each ground-truth segment that went unmatched.
+    # PQ has a hard cliff at 0.5, and crossing it is worth far more than the
+    # overlap gained: a near-miss is simultaneously a false positive and a false
+    # negative, so promoting one to a true positive moves the denominator by
+    # +1 - 0.5 - 0.5 = 0 while adding its IoU to the numerator.  Improvement is
+    # therefore free in the denominator, and the size of the prize is exactly
+    # how much mass sits just below 0.5 - which is what this records.
+    near_miss_ious: list[float] = field(default_factory=list)
+    area_ratios: list[float] = field(default_factory=list)
     one_to_many: int = 0
     many_to_one: int = 0
     semantic_dice: float = 0.0
@@ -165,6 +182,18 @@ def evaluate_image(
     matched_ious = [float(ious[g, p]) for g, p in matches]
     one_to_many, many_to_one = fragmentation_counts(ious)
 
+    near_miss = [float(ious[g].max()) for g in unmatched_gt] if ious.size else []
+
+    # Predicted area over ground-truth area, for matched pairs only.  IoU says
+    # how wrong a boundary is but not which way; this says whether the fix is to
+    # grow instances or shrink them, which is the difference between a useful
+    # dilation and a harmful one.
+    gt_area = rle_areas(gt)
+    pred_area = rle_areas(pred)
+    area_ratios = [
+        float(pred_area[p] / gt_area[g]) for g, p in matches if gt_area[g] > 0
+    ]
+
     return ImageResult(
         image_id=image_id,
         n_gt=len(gt),
@@ -174,6 +203,8 @@ def evaluate_image(
         fn=len(unmatched_gt),
         iou_sum=float(sum(matched_ious)),
         matched_ious=matched_ious,
+        near_miss_ious=near_miss,
+        area_ratios=area_ratios,
         one_to_many=one_to_many,
         many_to_one=many_to_one,
         semantic_dice=semantic_dice(gt, pred),
@@ -210,6 +241,17 @@ def evaluate(
 
     matched_ious = [i for r in results for i in r.matched_ious]
     dices = [dice_from_iou(i) for i in matched_ious]
+    near_miss = [i for r in results for i in r.near_miss_ious]
+
+    # How much PQ is sitting just under the cliff.  Promoting a near miss is
+    # denominator-neutral, so the gain is simply the IoU it would contribute
+    # divided by the unchanged denominator - which makes this an upper bound on
+    # what better boundaries alone are worth, with no change to detection.
+    almost = [i for i in near_miss if 0.4 <= i <= 0.5]
+    headroom = sum(almost) / denom if denom > 0 else 0.0
+
+    ratios = [r for x in results for r in x.area_ratios]
+    median_ratio = float(np.median(ratios)) if ratios else 0.0
 
     pq_micro = iou_sum / denom if denom > 0 else 0.0
     if not (0.0 <= pq_micro <= 1.0 + 1e-9):
@@ -239,8 +281,14 @@ def evaluate(
         "mean_semantic_dice": float(np.mean([r.semantic_dice for r in results]))
         if results
         else 0.0,
+        # Where the next PQ comes from, rather than how much we already have.
+        "near_miss_count": len(almost),
+        "near_miss_headroom_pq": headroom,
+        # >1 means predictions are larger than the truth they matched.
+        "median_area_ratio": median_ratio,
         "iou_distribution": matched_ious,
         "dice_distribution": dices,
+        "near_miss_distribution": near_miss,
     }
 
 
@@ -258,7 +306,10 @@ def format_report(report: dict) -> str:
         f"mean matched IoU    {report['mean_matched_iou']:.4f}",
         f"mean matched Dice   {report['mean_matched_dice']:.4f}",
         f"mean semantic Dice  {report['mean_semantic_dice']:.4f}",
-        f"one-to-many         {report['one_to_many']}  (fragmentation)",
-        f"many-to-one         {report['many_to_one']}  (over-merge)",
+        f"one-to-many         {report['one_to_many']}  (fragmentation, any overlap)",
+        f"many-to-one         {report['many_to_one']}  (over-merge, any overlap)",
+        f"near misses         {report['near_miss_count']}  (unmatched GT with IoU 0.4-0.5)",
+        f"  headroom          {report['near_miss_headroom_pq']:+.4f} PQ if all crossed 0.5",
+        f"median area ratio   {report['median_area_ratio']:.3f}  (pred/GT; >1 = we over-segment)",
     ]
     return "\n".join(lines)
