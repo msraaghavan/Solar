@@ -16,6 +16,12 @@ kernels/pulled/
 kernels/_runs/
 kernels/*/out/
 
+# The host's self-evaluation notebook, pulled for reference.  It is their code,
+# and this repository is MIT, so it is not redistributed here.  Our agreement
+# with it is asserted by an independent reimplementation of its stated rules in
+# tests/test_official_metric.py.
+kernels/official/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -26,3 +32,8 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# The host's report template and self-evaluation notebook, kept locally for
+# reference. Both are theirs, not ours, so they are not redistributed here.
+kaggle_comp_report_fi_segm_2026.pdf
+self-evaluation-notebook.ipynb

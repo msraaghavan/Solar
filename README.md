@@ -109,10 +109,15 @@ src/
   infer.py           overlapped tiling, cosine blending, dihedral TTA
   postprocess.py     hysteresis → connected components; PQ-driven coordinate-ascent tuner
   evaluate_fold.py   score a fold and fit the decision parameters
+  evaluate_oof.py    predict every observation with the model that held it out,
+                     then fit one operating point over the whole training set
   predict_test.py    ensemble the folds, write and validate the submission CSV
 tools/
   analysis.py        regenerates every measurement in the table above
   sync_src.py        publishes src/ as the Kaggle dataset the kernels attach
+tests/
+  test_pipeline.py       correctness of the pipeline, including its past bugs
+  test_official_metric.py agreement with the host's published scorer
 kernels/            thin Kaggle drivers (training, prediction, runtime probe)
 ```
 
@@ -123,9 +128,12 @@ pip install -r requirements.txt
 kaggle competitions download -c filament-segmentation-2026 -p data && unzip -d data data/*.zip
 python src/build_disk_cache.py --root data/MAGFiLO_1.0_Kaggle_2026
 python tools/analysis.py                      # regenerates the measurement table
+python tests/test_pipeline.py                 # 28 checks, no pytest required
+python tests/test_official_metric.py          # agreement with the host's scorer
 python src/train.py --fold 0                  # trains one fold
 python src/evaluate_fold.py --checkpoint artifacts/fold0_best.pt --fold 0
-python src/predict_test.py --checkpoints artifacts/fold*_best.pt --config artifacts/fold0_tuned.json
+python src/evaluate_oof.py --checkpoints artifacts/fold*_best.pt   # pooled operating point
+python src/predict_test.py --checkpoints artifacts/fold*_best.pt --config artifacts/oof_tuned.json
 ```
 
 `notebooks/pipeline.ipynb` runs the whole thing end to end.
@@ -133,9 +141,23 @@ python src/predict_test.py --checkpoints artifacts/fold*_best.pt --config artifa
 ## A note on the public leaderboard
 
 All 180 test observations also appear, with ground truth, in the public MAGFiLO 1.0
-release, and the leaderboard reflects that — 28 teams are tied at exactly 1.00. This
-solution does not use those annotations: it trains only on the provided training split,
-and its predictions come from the model. The competition's own evaluation is 70%
-quantitative plus 30% qualitative, judged on reproducible code, so a lookup table
-reproduces nothing. Local grouped cross-validation, scored with the PQ implementation in
-`src/metrics.py`, is used for every decision instead.
+release. Under the Dice-based metric the leaderboard used until August this was plainly
+visible — 28 teams were tied at exactly 1.00. The hosts switched the metric to Panoptic
+Quality on 7 Aug 2026 and re-scored on 12 Aug; those perfect scores are now gone.
+
+This solution does not use those annotations either way: it trains only on the provided
+training split, and its predictions come from the model. Every decision is made against
+local grouped cross-validation, scored with `src/metrics.py`.
+
+That implementation is not assumed to match the host's. The organisers published a
+[self-evaluation notebook](https://www.kaggle.com/code/azimahmadzadeh/self-evaluation-notebook)
+defining the metric exactly, and `tests/test_official_metric.py` re-derives their rules
+independently and asserts agreement — on multi-annotator observations, on empty
+predictions, and on crowded overlapping cases where our greedy one-to-one matching could
+in principle diverge from their all-pairs rule.
+
+One consequence of those rules is worth stating, because it decides how predictions are
+emitted. Ground truth is keyed by annotator *and* image, predictions by image alone, and
+the scorer looks predictions up by image. An observation read by three annotators is
+therefore scored three times against one and the same prediction set. Predicting once per
+observation is not a simplification — it is the only thing the format can express.
