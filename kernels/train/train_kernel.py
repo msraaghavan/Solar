@@ -71,6 +71,11 @@ TILES_PER_SAMPLE = int(os.environ.get("TILES_PER_SAMPLE", CONFIG["TILES_PER_SAMP
 VAL_EVERY = int(os.environ.get("VAL_EVERY", CONFIG["VAL_EVERY"]))
 VAL_FILES = int(os.environ.get("VAL_FILES", CONFIG["VAL_FILES"]))
 LR = os.environ.get("LR", CONFIG["LR"])
+# Optional, and read with .get so that a CONFIG block written before these
+# existed still runs.  0.0 leaves each feature off, which is what every fold
+# trained so far used, so runs stay comparable unless a variant asks otherwise.
+LABEL_SMOOTHING = float(os.environ.get("LABEL_SMOOTHING", CONFIG.get("LABEL_SMOOTHING", 0.0)))
+SPINE_WEIGHT = float(os.environ.get("SPINE_WEIGHT", CONFIG.get("SPINE_WEIGHT", 0.0)))
 print("CONFIG:", json.dumps(CONFIG), flush=True)
 
 t0 = time.time()
@@ -132,6 +137,10 @@ command = [
     "--val-files", str(VAL_FILES),
     "--workers", os.environ.get("WORKERS", "4"),
 ]
+if LABEL_SMOOTHING:
+    command += ["--label-smoothing", str(LABEL_SMOOTHING)]
+if SPINE_WEIGHT:
+    command += ["--spine-weight", str(SPINE_WEIGHT)]
 print(" ".join(command), flush=True)
 
 # Stream the child's output so progress is visible in the kernel log rather

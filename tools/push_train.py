@@ -77,6 +77,18 @@ def main() -> None:
     parser.add_argument("--val-every", type=int, default=5)
     parser.add_argument("--val-files", type=int, default=30)
     parser.add_argument("--lr", default="3e-4")
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help="soften targets; the task is label-noise-limited, so this is worth a fold",
+    )
+    parser.add_argument(
+        "--spine-weight",
+        type=float,
+        default=0.0,
+        help="weight on the auxiliary spine head (0 disables it)",
+    )
     parser.add_argument("--no-sync", action="store_true", help="skip re-publishing src/")
     args = parser.parse_args()
 
@@ -100,6 +112,8 @@ def main() -> None:
         "VAL_EVERY": args.val_every,
         "VAL_FILES": args.val_files,
         "LR": args.lr,
+        "LABEL_SMOOTHING": args.label_smoothing,
+        "SPINE_WEIGHT": args.spine_weight,
     }
 
     source = open(os.path.join(TEMPLATE_DIR, "train_kernel.py")).read()
