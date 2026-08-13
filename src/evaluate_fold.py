@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 import torch
 
-from data import load_contexts, load_samples, make_folds
+from data import load_contexts, load_samples, make_folds, stride_split
 from infer import disk_mask_for, predict_full
 from metrics import format_report
 from model import FilamentNet
@@ -87,7 +87,7 @@ def main() -> None:
         # materialising a 16 MB float array per annotator would cost several GB
         # over a fold for no reason.
         for sample in (s for s in val_samples if s.file_name == file_name):
-            predictions.append((sample.image_id, probability, mask))
+            predictions.append((sample.image_id, probability, mask, file_name))
             ground_truth[sample.image_id] = sample.instances
         if (i + 1) % 20 == 0:
             print(f"  {i + 1}/{len(file_names)} images ({time.time() - t0:.0f}s)", flush=True)
@@ -100,13 +100,20 @@ def main() -> None:
 
     # --- tune the decision parameters against PQ ---
     #
-    # Split first.  The tuner searches ~90 configurations, so scoring the winner
-    # on the same readings it was chosen from reports a selection-biased number.
+    # Split first.  The tuner searches ~100 configurations, so scoring the winner
+    # on the same data it was chosen from reports a selection-biased number.
     # Tuning uses one half and the headline figure comes from the other, which
-    # the search never saw.  The split interleaves rather than cutting the list
-    # in two, because file names sort by date.
-    tune_set = [p for i, p in enumerate(predictions) if i % 2 == 0]
-    held_out = [p for i, p in enumerate(predictions) if i % 2 == 1]
+    # the search never saw.  The split strides rather than cutting the list in
+    # two, because file names sort by date.
+    #
+    # The split is over *observations*, not readings.  Interleaving the reading
+    # list instead - which this script used to do - puts the two or three
+    # annotator readings of one image on opposite sides of the split: measured
+    # over the training set, 59.8% of the "held out" observations were also in
+    # the tuning half, so the reported optimism was itself optimistic.
+    tune_files, _ = stride_split(file_names)
+    tune_set = [p[:3] for p in predictions if p[3] in tune_files]
+    held_out = [p[:3] for p in predictions if p[3] not in tune_files]
     print(
         f"\n--- tuning post-processing on {len(tune_set)} readings, "
         f"reporting on {len(held_out)} held out ---",

@@ -157,6 +157,21 @@ def make_folds(
     return folds
 
 
+def stride_split(file_names: Sequence[str]) -> tuple[set[str], set[str]]:
+    """Halve a set of observations into (tune, report).
+
+    Two properties matter and neither is free.  The split *strides* rather than
+    cutting the sorted list in two, because file names sort by timestamp and a
+    prefix would put one solar-cycle epoch on each side.  And it splits over
+    observations rather than annotator readings: 42% of the training set is read
+    by two or three annotators, so splitting the reading list puts readings of
+    the same image on both sides - measured at 59.8% of the report half - and
+    the tuner then scores itself on observations it has already fitted to.
+    """
+    ordered = sorted(set(file_names))
+    return set(ordered[0::2]), set(ordered[1::2])
+
+
 class ImageContext:
     """Per-observation geometry and photometry, computed once and reused.
 
