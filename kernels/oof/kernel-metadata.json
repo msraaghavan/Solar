@@ -1,0 +1,27 @@
+{
+  "id": "raaghavanms/filament-oof",
+  "title": "filament-oof",
+  "code_file": "oof_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "raaghavanms/filament-src",
+    "raaghavanms/filament-cache"
+  ],
+  "competition_sources": [
+    "competitions/filament-segmentation-2026"
+  ],
+  "kernel_sources": [
+    "raaghavanms/filament-b0-fix",
+    "raaghavanms/filament-f1",
+    "raaghavanms/filament-f2",
+    "raaghavanms/filament-f3",
+    "raaghavanms/filament-f4"
+  ],
+  "model_sources": []
+}
