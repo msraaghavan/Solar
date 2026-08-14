@@ -404,6 +404,35 @@ def _():
         )
 
 
+@check("the ensemble threshold transfer names the top of a distribution, not its floor")
+def _():
+    from calibrate_ensemble import quantile_of, threshold_for
+
+    # All the mass at zero, a spike at 210/255.  Every threshold from 1/255 to
+    # 210/255 admits exactly that 1% spike, so "first bin under the target" - the
+    # obvious implementation - answers 1/255, which is not where the top 1%
+    # begins.  This is the bug the transfer had.
+    counts = np.zeros(256, dtype=np.int64)
+    counts[0], counts[210] = 9900, 100
+    assert abs(quantile_of(counts, 10000, 200 / 255) - 0.01) < 1e-9
+    assert abs(threshold_for(counts, 10000, 0.01) - 210 / 255) < 1e-9
+
+    rng = np.random.default_rng(0)
+    single = np.clip(rng.beta(2, 8, 200_000), 0, 1)
+    hist = np.bincount(np.round(single * 255).astype(np.uint8), minlength=256)
+    for level in (0.2, 0.3, 0.4, 0.5, 0.6):
+        fraction = quantile_of(hist, single.size, level)
+        assert abs(threshold_for(hist, single.size, fraction) - level) <= 2 / 255
+
+    # Averaging two independent draws is what ensembling does to a probability
+    # map: it pulls disputed pixels toward the middle and shaves the peaks.  The
+    # transferred threshold must therefore come *down*, which is the whole point.
+    averaged = (single + np.clip(rng.beta(2, 8, 200_000), 0, 1)) / 2
+    hist_avg = np.bincount(np.round(averaged * 255).astype(np.uint8), minlength=256)
+    moved = threshold_for(hist_avg, averaged.size, quantile_of(hist, single.size, 0.6))
+    assert moved < 0.6, "averaging shaves peaks; the threshold must fall"
+
+
 @check("connected components recover disjoint instances exactly")
 def _():
     p = np.zeros((128, 128), dtype=np.float32)
