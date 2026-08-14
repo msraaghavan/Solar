@@ -112,8 +112,13 @@ class PostprocessConfig:
 # optimum can be observed rather than assumed.  ``dilate_radius`` and
 # ``open_radius`` are unchanged: no fold has come near their ceilings.
 TUNING_GRIDS: dict[str, Iterable] = {
+    # Extended twice now.  The five folds pinned 0.70; the widened grid was then
+    # pinned at 0.95 by the pooled out-of-fold fit, still gaining at every step.
+    # The gains are decelerating (0.90 -> 0.95 was worth +0.0019, against +0.0022
+    # for 0.85 -> 0.90), so the optimum is close - but "close" is not "observed",
+    # and the top of this axis is now dense enough to see it turn over.
     "seed_threshold": (0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6,
-                       0.7, 0.75, 0.8, 0.85, 0.9, 0.95),
+                       0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.97, 0.98, 0.99, 0.995),
     "mask_threshold": (0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5,
                        0.55, 0.6, 0.7),
     "min_area": (0, 30, 60, 100, 150, 250, 400, 600, 800, 1200, 1800),
