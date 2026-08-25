@@ -126,17 +126,25 @@ that has never been used:**
 `seed_threshold 0.95 -> 0.9255`, `mask_threshold 0.40 -> 0.392`, everything else
 unchanged (areas are pixel counts; the ratio moves with the transfer).
 
-**IMMEDIATE NEXT ACTION: re-run `filament-predict` with this config and submit
-(after asking the user).** Point the predict kernel at `filament-calib`, or pass
-`--config` explicitly. The predict kernel prefers `oof_tuned.json` by name, so
-this needs a deliberate change — do not let it pick by sort order; that was a
-real bug, see commit 9e5f4c0.
+**IMMEDIATE NEXT ACTION: re-run `filament-predict` with a calibrated config and
+submit (after asking the user).** Point the predict kernel at `filament-calib`,
+or pass `--config` explicitly. The predict kernel prefers `oof_tuned.json` by
+name, so this needs a deliberate change — do not let it pick by sort order; that
+was a real bug, see commit 9e5f4c0.
 
-Caveat to state honestly: the transfer quantiles were computed on *training*
-images, where 4 of 5 models have seen each image, so the ensemble maps there are
-sharper than on test. The correction may therefore be an underestimate. Consider
-recomputing the ensemble histogram on the 180 **test** images — that uses no
-labels at all and is strictly more correct.
+**Recompute the config with `--on test` first (commit a9e1d82).** The stored
+0.9255 was measured on *training* images, where 4 of 5 models have seen each
+image, so the ensemble maps there are sharper than they will ever be on test and
+the correction is a **lower bound**, not an estimate. `--on test` measures both
+histograms on the 180 test images, where no model has seen anything, and pools
+all five models for the single-model family instead of picking one. It reads
+test *pixels*, never test annotations, so it stays label-free.
+
+Measuring both halves on the *same* images is the point, not an incidental
+detail: on a synthetic population 3x denser in filaments, transferring within
+either population agrees to 0.004, while mixing them moves `mask_threshold` by
+0.19 — "correcting" a real difference in the sky as though it were an artefact
+of averaging. Asserted in `tests/test_pipeline.py`.
 
 The shift is smaller than expected (-0.025 on seed), so calibration probably does
 not explain the whole -0.047. Other candidates: test-set annotator composition
@@ -148,10 +156,26 @@ not explain the whole -0.047. Other candidates: test-set annotator composition
    supervision.** Host: *"You can use other meta data available in the dataset
    (i.e., spine, bbox, area, and category_id)."* The spine auxiliary head is
    **already built** (`--spine-weight`, `FilamentNet(out_channels=2)`, inference
-   already slices channel 0) and is **wired through the kernel but never tested**.
-   The hosts explicitly name "structural continuity / fragmented segmentations"
-   as a core challenge, and fragmentation is graded. This is the single most
-   promising untested idea.
+   already slices channel 0) and wired through the kernel. The hosts explicitly
+   name "structural continuity / fragmented segmentations" as a core challenge,
+   and fragmentation is graded. This is the single most promising untested idea.
+
+   **The path is now covered by six tests (commit c828ece), but it has still
+   never touched a real annotation** — no session has had the data and a GPU at
+   the same time. Two silent failure modes were found and closed by inspection:
+   a spine wrapped one list deep (the way `segmentation` is) tripped the
+   `len(spine) < 4` guard and rasterised to an **all-zero target**, which would
+   have trained the head on a blank image behind a healthy-looking loss curve;
+   and `cv2.polylines` reads `(x, y)`, so `(row, column)` data would draw every
+   spine reflected about the diagonal onto quiet Sun. `spine_points` now accepts
+   flat, wrapped and paired forms; `spine_alignment` measures the quantity that
+   catches the rest.
+
+   **`train.py` preflight now refuses to start** unless ≥80% of spine pixels
+   fall inside their own filament (published figure: 95.4%). It runs on
+   annotation geometry alone, costs no GPU time, and prints the alignment. **If
+   that line does not appear, or the run dies on it, the spine field is being
+   misread — fix the parse, do not lower the bar.**
 2. **Self-supervised pretraining on external unlabeled GONG H-alpha images is
    ALLOWED.** Host answered "Yes." A legitimate way to add data.
 
@@ -174,11 +198,18 @@ not explain the whole -0.047. Other candidates: test-set annotator composition
 - `tools/bootstrap_pod.sh` sets up a rented GPU pod.
 - Runtime confirmed matching `requirements.txt`: torch 2.10.0+cu128, timm 1.0.26,
   numpy 2.0.2, cv2 4.13.0, scipy 1.16.3, Tesla T4.
+- **A cloud Claude session cannot do any of the above.** It gets a fresh
+  container: no `data/`, no `artifacts/`, no `kernels/_runs/`, no Kaggle or
+  RunPod credentials, no GPU, and outbound HTTPS restricted enough that
+  kaggle.com, arxiv.org and the competition site are all blocked. It can install
+  deps from PyPI, run both test suites, and read and write code — nothing that
+  touches the data or the leaderboard. Anything needing data or a GPU has to run
+  from the user's own machine.
 
-## Tests — 38 checks, all passing
+## Tests — 45 checks, all passing
 
-`python tests/test_pipeline.py` (31) and `python tests/test_official_metric.py`
-(7). No pytest needed. Several encode real bugs:
+`python tests/test_pipeline.py` (38) and `python tests/test_official_metric.py`
+(7). No pytest needed. Runs in ~4 s on CPU. Several encode real bugs:
 
 - the tuning grid must bracket every fitted value **and** every fitted value in
   every artefact (checks 73 values; `seed_threshold` was pinned at its ceiling in
@@ -189,23 +220,39 @@ not explain the whole -0.047. Other candidates: test-set annotator composition
 - fragmentation must use the host's any-overlap rule;
 - the ensemble threshold transfer must name the top of a distribution, not its
   floor (a step-function tail means whole ranges of thresholds admit the same
-  pixels).
+  pixels), and both its histograms must come from one image population;
+- the spine target must parse whatever nesting COCO used, must sit on its own
+  filament, and must reach the loss only when `--spine-weight` is set.
+
+Note that "every fitted value sits inside its grid" checks **0 values** unless
+`kernels/_runs/` is present — it walks the run artefacts, which are gitignored.
+It reports the count it checked; on the user's machine that is 73. A fresh clone
+will pass it vacuously.
 
 ## Bugs already found and fixed — do not reintroduce
 
 Earlier sessions: `persistent_workers=True` froze the dataset epoch (+0.052);
 fp16 NaN on B4 was silent because NaN comparisons are False; validation used
 `sorted()[:n]` so it only validated on 2011; `predict_full` assumed 1 output
-channel. This session: censored tuning grid; reading-level tune/report leak;
-fragmentation threshold mismatch; predict kernel choosing its config by
-alphabetical sort order.
+channel; censored tuning grid; reading-level tune/report leak; fragmentation
+threshold mismatch; predict kernel choosing its config by alphabetical sort
+order.
+
+25 Aug: `requirements.txt` pinned `opencv-python-headless==4.13.0`, which does
+not exist on PyPI — `cv2.__version__` reports `4.13.0` but the wheel is
+`4.13.0.90`, so the whole file failed to install. It is one of the two required
+repository deliverables, so this was the first thing a judge reproducing the
+pipeline would have hit. Also: the spine parse and coordinate-order traps above.
 
 ## Suggested priority order
 
-1. **Submit the calibrated config** (config already computed, needs one predict
-   run). Consider recomputing quantiles on test images first.
-2. **Test the spine auxiliary head** — sanctioned, built, untested, targets a
-   graded weakness. `--spine-weight 0.3` on fold 0, compare against 0.4387.
+1. **Submit a calibrated config.** Recompute it first with
+   `src/calibrate_ensemble.py --on test` (the stored 0.9255 is a lower bound,
+   see above), then one predict run. Both are GPU-only.
+2. **Test the spine auxiliary head** — sanctioned, built, now covered by tests
+   but still never run against real annotations. `--spine-weight 0.3` on fold 0,
+   compare against **0.4387** and nothing else; never across code versions.
+   Watch the preflight alignment line before the first epoch.
 3. **Attack the near-miss cliff** (+0.0359 available). We over-segment by 8%, so
    the lever is boundary *shape*, not size. Consider a boundary-aware loss.
 4. **Re-run the pooled OOF fit** once a better model exists; worth +0.02-0.03
