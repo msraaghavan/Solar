@@ -77,10 +77,23 @@ semantic Dice 0.6517.
 | B0 + label smoothing 0.05 | 0.4281 | 0.6724 | 0.6368 |
 | EfficientNet-B4 | 0.4177 | 0.6711 | 0.6223 |
 
-**Label smoothing (-0.011) and B4 (-0.021) are both rejected.** B4 still triggers
-fp32 recomputation for non-finite fp16 logits and costs 378 s/epoch against B0's
-233 s. Beware: against fold 0's *old-code* 0.4065, label smoothing looked like a
-+0.022 gain. It is a loss. **Never compare across code versions.**
+**Label smoothing (-0.011) is rejected.** Beware: against fold 0's *old-code*
+0.4065, it looked like a +0.022 gain. It is a loss. **Never compare across code
+versions.**
+
+**B4 (-0.021) is NOT settled, and this is the most important open question.**
+That run triggered fp32 recomputation for non-finite fp16 logits, and GradScaler
+drops a step silently whenever gradients overflow — so B4 may simply have been
+undertrained rather than genuinely worse. The T4 is Turing and has only fp16, so
+on Kaggle the confound is unavoidable. **Any Ampere card (3090/4090) has bf16,
+which carries fp32's exponent range and cannot overflow that way.**
+
+As of commit 7471e57 the code no longer hardcodes torch's fp16 default:
+`--amp-dtype auto` resolves to bf16 on compute capability >= 8.0 and stays fp16
+on the T4, so existing results remain reproducible. **Re-testing capacity on
+Ampere with bf16 is the single highest-value experiment available**, because it
+is the only lever anyone has identified that could be worth more than +0.05, and
+the one measurement against it is confounded.
 
 ## The single most important correction to earlier reasoning
 
@@ -206,9 +219,29 @@ not explain the whole -0.047. Other candidates: test-set annotator composition
   touches the data or the leaderboard. Anything needing data or a GPU has to run
   from the user's own machine.
 
-## Tests — 45 checks, all passing
+## Rented GPU — read before spending
 
-`python tests/test_pipeline.py` (38) and `python tests/test_official_metric.py`
+`tools/run_pod_experiment.sh` trains, evaluates, pushes results and **terminates
+the pod from a trap**, so it fires on success, on a failed job, on a crash and
+on Ctrl-C. `bootstrap_pod.sh` only prepares a pod and stops at a prompt; a
+finished pod bills exactly like a training one, so never leave that unattended.
+
+Two rules the runner enforces, both of which cost money to learn otherwise:
+
+1. **Always `--smoke` first.** One epoch, five steps, two validation files.
+   Costs cents, exercises spine preflight, a real step, full-disk inference,
+   instance extraction, the checkpoint round-trip and the result push.
+2. **Every spine run is paired with its own `spine-weight 0` baseline on the
+   same pod.** Fold 0's 0.4387 was measured under older code, on a T4, in fp16.
+   A pod is none of those three. Compare against the paired row, never 0.4387.
+
+**Checkpoints do not survive a pod** — they are ~50 MB and gitignored. For the
+five-fold ensemble, mount a network volume and point `ARTIFACT_DIR` at it, or
+the folds train, report their PQ and evaporate.
+
+## Tests — 47 checks, all passing
+
+`python tests/test_pipeline.py` (40) and `python tests/test_official_metric.py`
 (7). No pytest needed. Runs in ~4 s on CPU. Several encode real bugs:
 
 - the tuning grid must bracket every fitted value **and** every fitted value in
@@ -246,18 +279,26 @@ pipeline would have hit. Also: the spine parse and coordinate-order traps above.
 
 ## Suggested priority order
 
-1. **Submit a calibrated config.** Recompute it first with
+0. **`--smoke` on the first pod, before anything else.** Nothing in this repo
+   has ever run on a non-Kaggle GPU. Costs cents; proves the pipeline.
+1. **Re-test capacity on Ampere with bf16** (B4, and larger if it holds up).
+   The only identified lever that could be worth more than +0.05, and the one
+   measurement against it is confounded by fp16 overflow on a T4. Pair it with
+   a matched B0 baseline on the same pod.
+2. **Submit a calibrated config.** Recompute it first with
    `src/calibrate_ensemble.py --on test` (the stored 0.9255 is a lower bound,
    see above), then one predict run. Both are GPU-only.
-2. **Test the spine auxiliary head** — sanctioned, built, now covered by tests
+3. **Test the spine auxiliary head** — sanctioned, built, covered by tests, and
+   verified end to end on synthetic data (spine alignment 93.4%, gradient
+   reaches head channel 1, checkpoint round-trips, inference reads channel 0)
    but still never run against real annotations. `--spine-weight 0.3` on fold 0,
-   compare against **0.4387** and nothing else; never across code versions.
-   Watch the preflight alignment line before the first epoch.
-3. **Attack the near-miss cliff** (+0.0359 available). We over-segment by 8%, so
+   against its paired baseline. Watch the preflight alignment line.
+4. **Attack the near-miss cliff** (+0.0359 available). We over-segment by 8%, so
    the lever is boundary *shape*, not size. Consider a boundary-aware loss.
-4. **Re-run the pooled OOF fit** once a better model exists; worth +0.02-0.03
-   over per-fold configs, and the grid may still be censored.
-5. **Fix the 10 empty observations** with a relax-until-non-empty fallback.
+5. **Re-run the pooled OOF fit** once a better model exists; worth +0.02-0.03
+   over per-fold configs, and the grid may still be censored. This now also
+   fits `fallback_min_area` (the empty-observation rescue, commit 4e801b9),
+   which is on the grid at 0 and has never been fitted.
 6. **Write the 4-page report.** Required figures: a pipeline diagram and example
    segmentations. Required content: train/val/test split strategy, error bars (we
    have per-fold sd and measured selection optimism), and
