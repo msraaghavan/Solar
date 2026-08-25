@@ -12,7 +12,9 @@ import sys
 import time
 
 CONFIG = {
-    "IMAGES": 150,
+    # All 180 test images, not a sample: the histogram is the whole point and
+    # more pixels is strictly better here.  It costs ~3 min over 150.
+    "IMAGES": 180,
     "TTA": 4,
     # Measure both histograms on the *test* images.  On train images four of the
     # five models have seen each one, so the ensemble map there is sharper than
