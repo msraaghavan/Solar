@@ -312,6 +312,54 @@ def _():
     assert extract_instances(p, PostprocessConfig(min_seed_area=10**6)) == []
 
 
+@check("the empty-prediction fallback emits one candidate, and only when empty")
+def _():
+    # 10 of 707 observations emit nothing, and no training reading contains zero
+    # filaments, so an empty prediction set is certainly wrong.  The fallback
+    # must rescue exactly those cases without touching anything else - and must
+    # not flood a disk the model genuinely left blank.
+    disk = np.zeros((256, 256), dtype=bool)
+    yy, xx = np.mgrid[:256, :256]
+    disk[(yy - 128) ** 2 + (xx - 128) ** 2 <= 120**2] = True
+    off = PostprocessConfig()
+    on = PostprocessConfig(fallback_min_area=100)
+
+    # Above mask_threshold (0.35) but below seed_threshold (0.70): rejected.
+    faint = np.zeros((256, 256), dtype=np.float32)
+    faint[100:112, 90:150] = 0.45
+    assert extract_instances(faint, off, disk) == []
+    rescued = extract_instances(faint, on, disk)
+    assert len(rescued) == 1, f"expected one rescued candidate, got {len(rescued)}"
+    assert mask_utils.area(rescued[0]) == 12 * 60, mask_utils.area(rescued[0])
+
+    # A blank map must stay blank.  A fixed relaxation would admit the whole
+    # disk here; seeding from the map's own peak cannot.
+    assert extract_instances(np.zeros((256, 256), dtype=np.float32), on, disk) == []
+
+    # A peak below mask_threshold means no pixels reach the extent level either.
+    below = np.zeros((256, 256), dtype=np.float32)
+    below[100:112, 90:150] = 0.20
+    assert extract_instances(below, on, disk) == []
+
+    # Two weak blobs: only the more confident one is emitted, because each extra
+    # candidate must clear the marginal bar on its own and the second is weaker.
+    two = np.zeros((256, 256), dtype=np.float32)
+    two[100:112, 90:150] = 0.45
+    two[160:172, 90:150] = 0.40
+    assert len(extract_instances(two, on, disk)) == 1
+
+    # A configuration that already found something is untouched.
+    good = np.zeros((256, 256), dtype=np.float32)
+    good[100:112, 90:150] = 0.9
+    good[160:172, 90:150] = 0.9
+    assert [mask_utils.area(m) for m in extract_instances(good, off, disk)] == \
+           [mask_utils.area(m) for m in extract_instances(good, on, disk)]
+
+    # 0 must be an exact no-op so the tuner decides whether the axis earns a place.
+    assert PostprocessConfig().fallback_min_area == 0
+    assert 0 in postprocess.TUNING_GRIDS["fallback_min_area"]
+
+
 @check("the tuning split separates observations, not annotator readings")
 def _():
     # An observation read by three annotators produces three readings.  Splitting
