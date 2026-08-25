@@ -72,22 +72,67 @@ def request(method: str, path: str, body: dict | None = None) -> object:
 def start_command(args_line: str, hours: int) -> str:
     """The pod's whole life, as one shell command.
 
-    Deliberately tiny.  Everything that can be version-controlled lives in the
-    repository; this exists only to fetch the repository and to guarantee
-    termination in the cases where the repository never arrives.
+    Deliberately small.  Everything that can be version-controlled lives in the
+    repository; this exists to fetch the repository, to guarantee termination in
+    the cases where the repository never arrives, and to make those cases
+    *legible*.
+
+    That last part is not optional.  RunPod's REST API has no endpoint for a
+    running pod's console, and a terminated pod's logs are gone with it - so a
+    pod that dies during setup reports precisely nothing, and the first attempt
+    here did exactly that.  Everything below therefore runs with stdout and
+    stderr redirected to a file that is uploaded to Kaggle from the exit trap,
+    before the pod is destroyed.  It is the only evidence that survives a failure
+    happening *before* the repository, and hence the inner script, exists.
     """
     outer_seconds = (hours + 1) * 3600
     return "\n".join(
         [
             "set -x",
             "export DEBIAN_FRONTEND=noninteractive",
+            "",
+            "# /workspace is the default volume mount point, and this pod is",
+            "# deliberately created with no volume - so it is not guaranteed to",
+            "# exist.  `cd` into a missing directory would end the run here, with",
+            "# no repository, no inner script and, before the log upload below,",
+            "# no way to find out that was the reason.",
+            "mkdir -p /workspace",
+            "LOG=/workspace/pod_console.log",
+            "exec >\"$LOG\" 2>&1",
+            "",
+            "upload_log() {",
+            "  # Best effort, and separate from the results dataset: the inner",
+            "  # script publishes results by replacing that dataset's contents,",
+            "  # so writing the console into the same slug would delete them.",
+            "  d=/workspace/_log; rm -rf $d; mkdir -p $d",
+            '  tail -c 2000000 "$LOG" > $d/pod_console.log 2>/dev/null',
+            "  printf '{\"title\":\"pod-%s-log\",\"id\":\"%s/pod-%s-log\","
+            '"licenses":[{"name":"CC0-1.0"}]}\' '
+            '"$RUN_TAG" "$KAGGLE_USERNAME" "$RUN_TAG" > $d/dataset-metadata.json',
+            "  python -m pip install -q kaggle >/dev/null 2>&1",
+            "  python -m kaggle datasets create -p $d -q ||"
+            ' python -m kaggle datasets version -p $d -m "console" -q',
+            "}",
+            "",
             "terminate() {",
             '  curl -s -X DELETE "' + API + '/pods/$RUNPOD_POD_ID"'
             ' -H "Authorization: Bearer $RUNPOD_API_KEY" >/dev/null 2>&1',
             "}",
+            "",
+            "CLEANED=0",
+            "cleanup() {",
+            '  [ "$CLEANED" = "1" ] && return',
+            "  CLEANED=1",
+            "  upload_log",
+            "  terminate",
+            "}",
             "# Outer watchdog: covers a hang before the inner script is running.",
-            "( sleep " + str(outer_seconds) + " && terminate ) &",
-            "trap terminate EXIT INT TERM",
+            "( sleep " + str(outer_seconds) + " && cleanup ) &",
+            "trap cleanup EXIT INT TERM",
+            "",
+            "nvidia-smi || echo 'NO nvidia-smi'",
+            "python -V || echo 'NO python'",
+            "df -h /workspace",
             "command -v git >/dev/null ||"
             " (apt-get update -qq && apt-get install -y -qq git curl unzip)",
             "cd /workspace || exit 1",
@@ -95,6 +140,7 @@ def start_command(args_line: str, hours: int) -> str:
             "git clone --depth 1 " + REPO + " || exit 1",
             "cd Solar || exit 1",
             "bash tools/run_pod_experiment.sh " + args_line,
+            'echo "inner script exited $?"',
         ]
     )
 
