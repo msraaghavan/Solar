@@ -27,7 +27,16 @@ import torch
 from pycocotools import mask as mask_utils
 from torch.utils.data import DataLoader
 
-from data import ImageContext, Sample, build_contexts, load_samples, make_folds, save_contexts, load_contexts
+from data import (
+    ImageContext,
+    Sample,
+    build_contexts,
+    load_contexts,
+    load_samples,
+    make_folds,
+    save_contexts,
+    spine_alignment,
+)
 from dataset_torch import FilamentTiles
 from infer import disk_mask_for, predict_full
 from losses import FilamentLoss
@@ -125,6 +134,42 @@ def validate(
     return report
 
 
+def spine_preflight(dataset, n: int = 40, min_alignment: float = 0.80) -> None:
+    """Assert the spine annotation has actually been understood.
+
+    Cheap - it touches no image, only the annotation geometry - and decisive.
+    Spine pixels are supposed to lie on their own filament (95.4% do, measured at
+    thickness 3), so alignment is a single number that fails loudly for every
+    silent way of getting this wrong: a spine wrapped one list deep that
+    rasterises to nothing at all, or ``(row, column)`` coordinates handed to
+    ``cv2.polylines``, which reads ``(x, y)`` and would draw every spine
+    reflected about the disk diagonal - landing it on quiet Sun while still
+    producing a perfectly plausible-looking target.
+    """
+    samples = [s for s in dataset.samples if s.instances]
+    if not samples:
+        raise RuntimeError("preflight: no annotated samples to check the spine against")
+    step = max(len(samples) // n, 1)
+    chosen = samples[::step][:n]
+
+    scores = [spine_alignment(s) for s in chosen]
+    empty = sum(1 for inside, _ in scores if inside == 0.0)
+    inside = float(np.mean([s[0] for s in scores]))
+    covered = float(np.mean([s[1] for s in scores]))
+    print(
+        f"  spine target: {inside:.1%} of spine pixels inside their filament, "
+        f"covering {covered:.1%} of its area ({empty}/{len(chosen)} readings empty)",
+        flush=True,
+    )
+    if inside < min_alignment:
+        raise RuntimeError(
+            f"preflight: only {inside:.1%} of spine pixels fall inside their own "
+            f"filament (expected ~95%).  The spine annotation is being misread - "
+            f"check the coordinate order and the nesting of the 'spine' field "
+            f"before spending GPU hours training against a wrong target."
+        )
+
+
 def preflight(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
@@ -149,10 +194,29 @@ def preflight(
     print("--- preflight ---", flush=True)
     amp = device.startswith("cuda")
 
+    # 0. The auxiliary spine target, if it is switched on.  This path had never
+    # run against real annotations, and every way of misreading the field fails
+    # *silently* to an all-zero channel: the head then learns to predict nothing,
+    # the loss curve looks perfectly healthy, and hours of GPU time report that
+    # the spine "does not help" without ever having tested it.
+    if getattr(loader.dataset, "with_spine", False):
+        spine_preflight(loader.dataset)
+
     # 1. One real training step, in the same precision the run will use.
     t0 = time.time()
     features, target, weight = next(iter(loader))
     load_time = time.time() - t0
+
+    if getattr(loader.dataset, "with_spine", False):
+        if target.shape[1] != 2:
+            raise RuntimeError(
+                f"preflight: spine training wants a 2-channel target, got {target.shape[1]}"
+            )
+        if float(target[:, 1].sum()) <= 0.0:
+            raise RuntimeError(
+                "preflight: the spine channel is empty across a whole batch of "
+                "filament-centred tiles - the target is not reaching the loss"
+            )
     features, target, weight = (
         features.to(device), target.to(device), weight.to(device)
     )

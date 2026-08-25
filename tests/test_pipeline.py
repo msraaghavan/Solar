@@ -23,7 +23,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from pycocotools import mask as mask_utils  # noqa: E402
 
 import metrics  # noqa: E402
-from data import FEATURE_MEAN, FEATURE_STD, ImageContext, make_folds, Sample, stride_split  # noqa: E402
+from data import (  # noqa: E402
+    FEATURE_MEAN,
+    FEATURE_STD,
+    ImageContext,
+    Sample,
+    make_folds,
+    rasterise_spines,
+    stride_split,
+)
 import postprocess  # noqa: E402
 from postprocess import PostprocessConfig, extract_instances, marginal_threshold  # noqa: E402
 from preprocess import Disk, detect_disk, flat_field, limb_profile  # noqa: E402
@@ -521,6 +529,170 @@ def _():
     assert abs(float(probability[on_disk].max()) - 0.5) < 1e-5, (
         "spine channel leaked into the filament probability"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The auxiliary spine head
+#
+# The host sanctioned spine metadata as training supervision, and this path is
+# wired end to end but had never run against a real annotation.  Every one of
+# its failure modes is silent - a target that rasterises to nothing, or one
+# drawn transposed, still produces a healthy-looking loss curve - so it is
+# tested here rather than discovered after a GPU run reports "no effect".
+# --------------------------------------------------------------------------- #
+
+
+@check("a spine parses identically however COCO nested it")
+def _():
+    from data import spine_points
+
+    flat = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    wrapped = [[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]]      # like `segmentation`
+    paired = [[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]   # already (x, y) pairs
+    want = np.array([[10, 20], [30, 40], [50, 60]], dtype=np.float32)
+
+    for name, form in (("flat", flat), ("wrapped", wrapped), ("paired", paired)):
+        got = spine_points(form)
+        assert np.array_equal(got, want), f"{name} form parsed as {got.tolist()}"
+
+    assert len(spine_points([])) == 0
+    assert len(spine_points(None)) == 0
+    # A wrapped spine used to fall through a `len(spine) < 4` guard and rasterise
+    # to nothing, which is the whole reason this test exists.
+    assert len(rasterise_spines([wrapped[0]], size=128).nonzero()[0]) > 0
+
+    try:
+        spine_points([1.0, 2.0, 3.0])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an odd coordinate count must not be silently truncated")
+
+
+@check("a spine crossing a tile boundary is drawn continuously")
+def _():
+    # The tile target is cut from a full-frame rasterisation, which is what makes
+    # a spine entering from off-tile continuous at the seam.  Drawing it per tile
+    # in a shifted frame would be cheaper, but cv2.polylines clips to integer
+    # canvas bounds and lands the line up to a pixel off (IoU 0.89 against this,
+    # worst case 0.69) - for 0.2% of a data pipeline dominated by the JPEG
+    # decode.  Guard the property, not the micro-optimisation.
+    crossing = [100.0, 640.0, 900.0, 660.0]         # enters the tile from the left
+    y0, x0, size = 512, 512, 512
+    tile = rasterise_spines([crossing])[y0 : y0 + size, x0 : x0 + size]
+
+    columns = np.flatnonzero(tile.any(axis=0))
+    assert columns[0] == 0, "a spine from off-tile must reach the tile edge"
+    assert np.array_equal(columns, np.arange(columns[0], columns[-1] + 1)), (
+        "the drawn spine has a gap; it is not one connected polyline"
+    )
+    # A spine nowhere near the tile contributes nothing to it.
+    assert rasterise_spines([[50.0, 50.0, 120.0, 90.0]])[y0 : y0 + size, x0 : x0 + size].sum() == 0
+
+
+@check("spine alignment detects a transposed coordinate convention")
+def _():
+    from data import Sample, spine_alignment
+
+    # A horizontal bar filament with its spine running along the axis.
+    mask = box(256, 100, 116, 40, 200)
+    axis = [45.0, 108.0, 195.0, 108.0]          # (x, y): along the bar
+    transposed = [108.0, 45.0, 108.0, 195.0]    # (y, x) fed to a (x, y) drawer
+
+    good = Sample("i", "f.jpeg", [rle(mask)], spines=[axis])
+    bad = Sample("i", "f.jpeg", [rle(mask)], spines=[transposed])
+
+    inside_good, covered_good = spine_alignment(good)
+    inside_bad, _ = spine_alignment(bad)
+    assert inside_good > 0.95, inside_good
+    assert 0.0 < covered_good < 0.6, covered_good  # a core, not the whole filament
+    assert inside_bad < 0.2, (
+        f"a transposed spine scored {inside_bad:.2f}; preflight would not catch it"
+    )
+    # An empty spine reads as zero rather than raising, so preflight reports it.
+    assert spine_alignment(Sample("i", "f.jpeg", [rle(mask)], spines=[[]])) == (0.0, 0.0)
+
+
+@check("the spine channel reaches the loss only when it is switched on")
+def _():
+    import torch
+
+    from losses import FilamentLoss
+
+    torch.manual_seed(0)
+    logits = torch.zeros(2, 2, 32, 32, requires_grad=True)
+    target = torch.zeros(2, 2, 32, 32)
+    target[:, 0, 8:24, 8:24] = 1.0   # filament
+    target[:, 1, 14:18, 8:24] = 1.0  # its spine
+    weight = torch.ones(2, 1, 32, 32)
+
+    def spine_grad(spine_weight):
+        logits.grad = None
+        FilamentLoss(spine_weight=spine_weight)(logits, target, weight).backward()
+        return float(logits.grad[:, 1].abs().sum())
+
+    assert spine_grad(0.0) == 0.0, "the spine channel must be inert when disabled"
+    assert spine_grad(0.3) > 0.0, (
+        "spine_weight is set but no gradient reaches channel 1 - the auxiliary "
+        "head is being trained on nothing"
+    )
+    # A 1-channel target must not silently drop the spine term into a shape error.
+    FilamentLoss(spine_weight=0.3)(logits[:, :1], target[:, :1], weight).backward()
+
+
+@check("training pairs the spine head with the spine target, or neither")
+def _():
+    # Two independent switches - the model's out_channels and the dataset's
+    # with_spine - must move together.  Either one alone fails silently: a second
+    # head with no target gets no gradient, and a second target with no head is
+    # dropped by the loss's shape guard.
+    import re
+
+    source = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "train.py")).read()
+    for pattern, what in (
+        (r"with_spine\s*=\s*args\.spine_weight\s*>\s*0", "dataset target"),
+        (r"out_channels\s*=\s*2\s+if\s+args\.spine_weight\s*>\s*0\s+else\s+1", "model head"),
+        (r"spine_weight\s*=\s*args\.spine_weight", "loss term"),
+    ):
+        assert re.search(pattern, source), f"{what} is not gated on --spine-weight"
+
+
+@check("a spine-enabled dataset emits a two-channel target")
+def _():
+    import torch
+
+    from dataset_torch import FilamentTiles
+    from data import Sample
+
+    disk = Disk(1024.0, 1024.0, 900.0)
+    context = ImageContext(disk, np.full(256, 128.0, dtype=np.float32))
+    mask = box(2048, 1000, 1040, 900, 1200)
+    sample = Sample(
+        "010401-x", "x.jpeg", [rle(mask)], spines=[[905.0, 1020.0, 1195.0, 1020.0]]
+    )
+
+    class OneImage(dict):
+        def __getitem__(self, key):
+            return context
+
+    image_dir = "artifacts/_spine_fixture"
+    os.makedirs(image_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(image_dir, "x.jpeg"), np.full((2048, 2048), 128, np.uint8))
+
+    for with_spine, channels in ((False, 1), (True, 2)):
+        dataset = FilamentTiles(
+            [sample], image_dir, OneImage(), tiles_per_sample=4,
+            augment=False, with_spine=with_spine,
+        )
+        _, target, _ = dataset[0]
+        assert target.shape[0] == channels, (with_spine, target.shape)
+        if with_spine:
+            assert float(target[1].sum()) > 0.0, "spine channel is empty on a hit tile"
+            assert float(target[1].sum()) < float(target[0].sum()), (
+                "the spine must be a core inside the filament, not larger than it"
+            )
+    os.remove(os.path.join(image_dir, "x.jpeg"))
+    os.rmdir(image_dir)
 
 
 @check("post-processing defaults match the configuration fitted against PQ")
