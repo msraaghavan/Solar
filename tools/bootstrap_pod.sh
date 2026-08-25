@@ -50,6 +50,13 @@ print("installing:", ", ".join(keep))
 PY
 python -m pip install -q -r /tmp/reqs-nopod-torch.txt
 
+# The Kaggle CLI is deliberately not in requirements.txt: that file documents the
+# runtime the submitted results were produced *on*, and the competition image
+# already provides it.  A rented pod provides nothing, and needs it twice - to
+# fetch the data below, and to publish results and checkpoints afterwards, which
+# is the only way anything survives an ephemeral pod.
+python -m pip install -q kaggle
+
 python - <<'PY'
 import torch
 print(f"torch {torch.__version__}  cuda {torch.version.cuda}  "
@@ -64,7 +71,11 @@ PY
 if [ ! -d "$DATA/MAGFiLO_1.0_Kaggle_2026" ]; then
     echo "=== fetching competition data (751 MB) ==="
     mkdir -p "$DATA"
-    chmod 600 ~/.kaggle/kaggle.json
+    # The CLI also reads KAGGLE_USERNAME/KAGGLE_KEY straight from the
+    # environment, which is how a pod normally receives them, so the file is
+    # optional here.  Under `set -e` an unconditional chmod on a file that was
+    # never written would end the run before it started.
+    [ -f ~/.kaggle/kaggle.json ] && chmod 600 ~/.kaggle/kaggle.json
     python -m kaggle competitions download -c filament-segmentation-2026 -p "$DATA"
     unzip -q -d "$DATA" "$DATA"/*.zip && rm -f "$DATA"/*.zip
 fi

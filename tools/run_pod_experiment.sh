@@ -33,6 +33,10 @@ REPO=${REPO:-https://github.com/msraaghavan/Solar.git}
 WORK=${WORK:-/workspace}
 ARTIFACT_DIR=${ARTIFACT_DIR:-$WORK/artifacts}
 RESULT_BRANCH=${RESULT_BRANCH:-pod-results}
+# Names the Kaggle dataset this pod publishes into.  Distinct per pod, because
+# two pods running in parallel would otherwise version the same dataset and race.
+RUN_TAG=${RUN_TAG:-$(date -u +%m%d%H%M)}
+KAGGLE_USER=${KAGGLE_USER:-raaghavanms}
 MAX_HOURS=${MAX_HOURS:-6}
 KEEP_ALIVE=${KEEP_ALIVE:-0}       # 1 = do not terminate (debugging only)
 
@@ -135,8 +139,47 @@ terminate_pod() {
     fi
 }
 
+# Kaggle is the primary way results leave this pod, for two reasons.  There is
+# no GitHub token on this account, so the git path below is usually dead; and
+# checkpoints do not survive a pod without a network volume, while a Kaggle
+# dataset both stores them and can be attached directly to the prediction kernel
+# by `dataset_sources` - so a fold trained here is immediately usable there.
+publish_to_kaggle() {
+    command -v kaggle >/dev/null 2>&1 || python -m kaggle --version >/dev/null 2>&1 || {
+        echo "!!! no kaggle CLI; results cannot leave this pod"; return 1; }
+    local slug="$KAGGLE_USER/filament-pod-$RUN_TAG"
+    local stage="$WORK/publish"
+    rm -rf "$stage"; mkdir -p "$stage"
+
+    cp -f "$SUMMARY" "$stage/" 2>/dev/null
+    # $1 = "light" for a progress heartbeat: text only.  Checkpoints are ~50 MB
+    # each and would make a heartbeat cost minutes of upload, which defeats the
+    # purpose of having one.
+    [ "${1:-full}" = "light" ] || cp -f "$ARTIFACT_DIR"/*.pt "$stage/" 2>/dev/null
+    cp -f "$ARTIFACT_DIR"/*_history.json "$stage/" 2>/dev/null
+    cp -f "$ARTIFACT_DIR"/*_tuned.json "$stage/" 2>/dev/null
+    # Tails, not whole logs: enough to read why a job failed or whether it was
+    # still improving when it stopped, without uploading megabytes.
+    for log in "$ARTIFACT_DIR"/train_*.log "$ARTIFACT_DIR"/eval_*.log; do
+        [ -f "$log" ] && tail -n 200 "$log" > "$stage/$(basename "$log")"
+    done
+
+    cat > "$stage/dataset-metadata.json" <<META
+{"title": "filament-pod-$RUN_TAG", "id": "$slug", "licenses": [{"name": "CC0-1.0"}]}
+META
+
+    echo "=== publishing $(ls -1 "$stage" | wc -l) files (${1:-full}) to kaggle $slug ==="
+    # create the first time, version every time after.  Either can be the one
+    # that works, so try both and let the summary below report what landed.
+    python -m kaggle datasets create -p "$stage" -r zip -q 2>&1 | tail -3 ||
+    python -m kaggle datasets version -p "$stage" -r zip -m "pod $RUN_TAG" -q 2>&1 | tail -3
+    echo "=== kaggle dataset: $slug ==="
+}
+
 push_results() {
     [ -f "$SUMMARY" ] || return 0
+    publish_to_kaggle || echo "!!! Kaggle publish failed; see the summary below"
+    [ -n "${GITHUB_TOKEN:-}" ] || { cat "$SUMMARY"; return 0; }
     echo "=== pushing results to $RESULT_BRANCH ==="
     cd "$WORK/Solar" || return 0
     mkdir -p results
@@ -149,11 +192,6 @@ push_results() {
         [ -f "$log" ] && tail -n 120 "$log" > "results/$(basename "$log")"
     done
 
-    if [ -z "${GITHUB_TOKEN:-}" ]; then
-        echo "no GITHUB_TOKEN; results stay on the pod only:"
-        cat "$SUMMARY"
-        return 0
-    fi
     git config user.email "pod@localhost"
     git config user.name  "runpod"
     git checkout -B "$RESULT_BRANCH" >/dev/null 2>&1
@@ -206,6 +244,18 @@ trap cleanup EXIT INT TERM
 # --------------------------------------------------------------------------- #
 
 mkdir -p "$ARTIFACT_DIR"
+
+# bootstrap_pod.sh needs ~/.kaggle/kaggle.json to fetch the competition data and
+# runs under `set -e`, so a missing file kills it before anything trains.  The
+# credentials arrive as environment variables rather than a file, because a pod's
+# shell history is not private and a token pasted into a command persists there.
+if [ ! -f ~/.kaggle/kaggle.json ] && [ -n "${KAGGLE_KEY:-}" ]; then
+    mkdir -p ~/.kaggle
+    ( umask 077; printf '{"username":"%s","key":"%s"}'         "${KAGGLE_USERNAME:-$KAGGLE_USER}" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json )
+    chmod 600 ~/.kaggle/kaggle.json
+    echo "wrote ~/.kaggle/kaggle.json from the environment"
+fi
+
 cd "$WORK"
 [ -d Solar ] || git clone -q "$REPO"
 cd Solar
@@ -214,7 +264,19 @@ git pull -q 2>/dev/null
 bash tools/bootstrap_pod.sh || { echo "bootstrap failed"; exit 1; }
 
 WORKERS=$(( $(nproc) > 16 ? 16 : $(nproc) ))
-echo "run started $(date -u +%FT%TZ)" > "$SUMMARY"
+{
+    echo "run started $(date -u +%FT%TZ)"
+    echo "gpu: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
+    echo "vcpus: $(nproc)  workers: $WORKERS"
+    echo "queue: ${JOBS[*]}"
+    echo "bootstrap: ok (data fetched, both test suites passed)"
+} > "$SUMMARY"
+
+# Publish once here, before any training.  There is no way to read a running
+# pod's logs from the API, so without this a pod that dies during the first
+# epoch is indistinguishable from one that never got its data - and the two
+# call for completely different fixes.
+publish_to_kaggle light || true
 
 # --------------------------------------------------------------------------- #
 # The queue.  Each job appends one line to the summary, so a pod that dies
@@ -271,6 +333,7 @@ for job in "${JOBS[@]}"; do
     label="$ENCODER  spine=$weight"
     [ "$weight" = "0" ] && label="$ENCODER  baseline (spine off)"
     echo "$label  PQ=${pq:-unknown}" >> "$SUMMARY"
+    publish_to_kaggle light || true
 done
 
 if [ "$BASELINE" = "1" ]; then
