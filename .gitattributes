@@ -1,0 +1,6 @@
+# The pod scripts are authored on Windows and executed on Linux.  A shell script
+# committed with CRLF fails there on its first line with a bare `$'\r': command
+# not found`, which on a rented pod means paying for a machine that never starts
+# the job.  Force LF in the repository regardless of the checkout's autocrlf.
+*.sh text eol=lf
+*.py text eol=lf
