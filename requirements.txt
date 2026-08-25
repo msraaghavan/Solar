@@ -6,7 +6,10 @@ torch==2.10.0
 torchvision==0.25.0
 timm==1.0.26
 numpy==2.0.2
-opencv-python-headless==4.13.0
+# cv2.__version__ reports "4.13.0", but the distribution carries a fourth
+# component and "==4.13.0" resolves to nothing on PyPI - so the whole file
+# failed to install.  Pin the wheel that reports that version.
+opencv-python-headless==4.13.0.90
 pycocotools==2.0.10
 scipy==1.16.3
 scikit-image==0.25.2
