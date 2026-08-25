@@ -37,9 +37,9 @@ MAX_HOURS=${MAX_HOURS:-6}
 KEEP_ALIVE=${KEEP_ALIVE:-0}       # 1 = do not terminate (debugging only)
 
 SPINE_WEIGHTS=()
+ENCODERS=()
 FOLD=${FOLD:-0}
 EPOCHS=${EPOCHS:-30}
-ENCODER=${ENCODER:-tf_efficientnet_b0}
 BASELINE=${BASELINE:-1}    # also run spine-weight 0 on this pod; see below
 SMOKE=0
 
@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
         --spine)  SPINE_WEIGHTS+=("$2"); shift 2 ;;
         --fold)   FOLD="$2";   shift 2 ;;
         --epochs) EPOCHS="$2"; shift 2 ;;
-        --encoder) ENCODER="$2"; shift 2 ;;
+        --encoder) ENCODERS+=("$2"); shift 2 ;;
         --no-baseline) BASELINE=0; shift ;;
         --smoke)  SMOKE=1; shift ;;
         --keep-alive) KEEP_ALIVE=1; shift ;;
@@ -56,6 +56,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ ${#SPINE_WEIGHTS[@]} -eq 0 ] && SPINE_WEIGHTS=(0.3)
+[ ${#ENCODERS[@]} -eq 0 ] && ENCODERS=(tf_efficientnet_b0)
 
 # --smoke: one epoch, five steps, two validation files.  Costs a few cents and
 # exercises every path that can fail after an hour of billing - the spine
@@ -80,6 +81,23 @@ fi
 if [ "$BASELINE" = "1" ]; then
     SPINE_WEIGHTS=(0 "${SPINE_WEIGHTS[@]}")
 fi
+
+# The queue is every encoder crossed with every spine weight, which is what lets
+# the *capacity* question be asked the same way:
+#
+#   --encoder tf_efficientnet_b0 --encoder tf_efficientnet_b4 --spine 0 --no-baseline
+#
+# runs B0 and B4 back to back on one pod, one card, one precision, one code
+# version - so the difference between their PQs is the encoder and nothing else.
+# The single existing B4 number cannot be used for this: it was measured on a T4
+# in fp16, where B4 overflowed and GradScaler dropped steps silently.
+JOBS=()
+for enc in "${ENCODERS[@]}"; do
+    for w in "${SPINE_WEIGHTS[@]}"; do
+        JOBS+=("$enc|$w")
+    done
+done
+echo "queue (${#JOBS[@]} jobs): ${JOBS[*]}"
 
 STARTED=$(date +%s)
 SUMMARY="$ARTIFACT_DIR/pod_summary.txt"
@@ -125,6 +143,11 @@ push_results() {
     cp -f "$SUMMARY" results/ 2>/dev/null
     cp -f "$ARTIFACT_DIR"/fold*_history.json results/ 2>/dev/null
     cp -f "$ARTIFACT_DIR"/*_tuned.json       results/ 2>/dev/null
+    # Tails, not whole logs: enough to read why a job failed or whether it
+    # was still improving when it stopped, without committing megabytes.
+    for log in "$ARTIFACT_DIR"/train_*.log "$ARTIFACT_DIR"/eval_*.log; do
+        [ -f "$log" ] && tail -n 120 "$log" > "results/$(basename "$log")"
+    done
 
     if [ -z "${GITHUB_TOKEN:-}" ]; then
         echo "no GITHUB_TOKEN; results stay on the pod only:"
@@ -135,7 +158,7 @@ push_results() {
     git config user.name  "runpod"
     git checkout -B "$RESULT_BRANCH" >/dev/null 2>&1
     git add -f results
-    git commit -q -m "Pod results: fold $FOLD, spine ${SPINE_WEIGHTS[*]}" 2>/dev/null
+    git commit -q -m "Pod results: fold $FOLD, jobs ${JOBS[*]}" 2>/dev/null
     git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/msraaghavan/Solar.git" \
         "$RESULT_BRANCH" 2>&1 | sed 's/x-access-token:[^@]*@/x-access-token:***@/g'
 }
@@ -198,7 +221,12 @@ echo "run started $(date -u +%FT%TZ)" > "$SUMMARY"
 # halfway still reports what it managed.
 # --------------------------------------------------------------------------- #
 
-for weight in "${SPINE_WEIGHTS[@]}"; do
+for job in "${JOBS[@]}"; do
+    ENCODER="${job%%|*}"
+    weight="${job##*|}"
+    # Tags every artefact for this job.  It has to carry the encoder as well as
+    # the weight, or a two-encoder queue silently overwrites its own results.
+    tag="${ENCODER#tf_efficientnet_}_spine${weight}"
     echo ""
     echo "=== fold $FOLD, encoder $ENCODER, spine-weight $weight ==="
     default_val=(--val-every 3 --val-files 40)
@@ -208,26 +236,40 @@ for weight in "${SPINE_WEIGHTS[@]}"; do
         --tile-size 512 --batch-size 8 --tiles-per-sample 8 \
         --epochs "$EPOCHS" "${default_val[@]}" "${SMOKE_ARGS[@]}" \
         --workers "$WORKERS" --spine-weight "$weight" \
-        --out-dir "$ARTIFACT_DIR" 2>&1 | tee "$ARTIFACT_DIR/train_spine${weight}.log"
+        --out-dir "$ARTIFACT_DIR" 2>&1 | tee "$ARTIFACT_DIR/train_${tag}.log"
 
     checkpoint="$ARTIFACT_DIR/fold${FOLD}_best.pt"
     if [ ! -f "$checkpoint" ]; then
-        echo "spine=$weight  FAILED (no checkpoint)" >> "$SUMMARY"
+        echo "$ENCODER spine=$weight  FAILED (no checkpoint)" >> "$SUMMARY"
         continue
     fi
-    mv "$checkpoint" "$ARTIFACT_DIR/fold${FOLD}_spine${weight}.pt"
+    mv "$checkpoint" "$ARTIFACT_DIR/fold${FOLD}_${tag}.pt"
+    # train.py names its history by fold alone, so the second job in the
+    # queue would overwrite the first one's curve.  Tag it by weight while
+    # it still exists; the summary line survives either way, but the loss
+    # curve is what tells an undertrained run apart from a worse one.
+    mv -f "$ARTIFACT_DIR/fold${FOLD}_history.json" \
+          "$ARTIFACT_DIR/fold${FOLD}_${tag}_history.json" 2>/dev/null
 
     # Score it the same way fold 0's 0.4387 baseline was scored.  Comparing to
     # anything measured under a different code version is how label smoothing
     # once looked like a +0.022 gain when it was a loss.
+    #
+    # --out must be per weight and inside ARTIFACT_DIR.  Its default is the
+    # fixed path artifacts/fold0_tuned.json, so both jobs would write one
+    # file *outside* the directory push_results collects: the baseline's
+    # fitted operating point would be overwritten by the spine run's, and
+    # neither would ever leave the pod.
     python src/evaluate_fold.py \
-        --checkpoint "$ARTIFACT_DIR/fold${FOLD}_spine${weight}.pt" \
-        --fold "$FOLD" 2>&1 | tee "$ARTIFACT_DIR/eval_spine${weight}.log"
+        --checkpoint "$ARTIFACT_DIR/fold${FOLD}_${tag}.pt" \
+        --fold "$FOLD" \
+        --out "$ARTIFACT_DIR/fold${FOLD}_${tag}_tuned.json" \
+        2>&1 | tee "$ARTIFACT_DIR/eval_${tag}.log"
 
-    pq=$(grep -oE '"pq_micro":[[:space:]]*[0-9.]+' "$ARTIFACT_DIR/eval_spine${weight}.log" \
+    pq=$(grep -oE '"pq_micro":[[:space:]]*[0-9.]+' "$ARTIFACT_DIR/eval_${tag}.log" \
          | tail -1 | grep -oE '[0-9.]+$')
-    label="spine=$weight"
-    [ "$weight" = "0" ] && label="baseline (spine off)"
+    label="$ENCODER  spine=$weight"
+    [ "$weight" = "0" ] && label="$ENCODER  baseline (spine off)"
     echo "$label  PQ=${pq:-unknown}" >> "$SUMMARY"
 done
 
