@@ -132,26 +132,33 @@ average. Averaging shaves probability peaks, so `seed_threshold=0.95` admits
 less. Symptom: 6.15 instances/image on test vs 6.8 per observation out-of-fold.
 
 `src/calibrate_ensemble.py` fixes this without labels — it holds the *admitted
-pixel mass* fixed rather than the threshold. **It has run and produced a result
-that has never been used:**
+pixel mass* fixed rather than the threshold.
 
-`kernels/_runs/out_calib/ensemble_config.json` —
-`seed_threshold 0.95 -> 0.9255`, `mask_threshold 0.40 -> 0.392`, everything else
-unchanged (areas are pixel counts; the ratio moves with the transfer).
+**DONE, 25 Aug 2026.** Measured on the 180 **test** images (`--on test`), five
+models, 0.48 G on-disk pixels, 18.8 min:
 
-**IMMEDIATE NEXT ACTION: re-run `filament-predict` with a calibrated config and
-submit (after asking the user).** Point the predict kernel at `filament-calib`,
-or pass `--config` explicitly. The predict kernel prefers `oof_tuned.json` by
-name, so this needs a deliberate change — do not let it pick by sort order; that
-was a real bug, see commit 9e5f4c0.
+| threshold | fitted | admits | ensemble | admits |
+|---|---|---|---|---|
+| `seed_threshold` | 0.950 | 3.607e-03 | **0.929** | 3.605e-03 |
+| `mask_threshold` | 0.400 | 6.331e-03 | **0.392** | 6.341e-03 |
 
-**Recompute the config with `--on test` first (commit a9e1d82).** The stored
-0.9255 was measured on *training* images, where 4 of 5 models have seen each
-image, so the ensemble maps there are sharper than they will ever be on test and
-the correction is a **lower bound**, not an estimate. `--on test` measures both
-histograms on the 180 test images, where no model has seen anything, and pools
-all five models for the single-model family instead of picking one. It reads
-test *pixels*, never test annotations, so it stays label-free.
+Stored at `kernels/_runs/out_calib_test/ensemble_config.json`, tagged
+`"measured_on": "test"` — check that field before trusting any such file, since a
+train-measured one looks identical otherwise.
+
+**The prediction made here was wrong, and in the interesting direction.** The
+train-measured shift (0.95 -> 0.9255) was written up as a *lower bound*, on the
+argument that four of five models have seen each training image so the ensemble
+histogram there is artificially sharp. The honest test-side measurement gives
+**0.929**, a *smaller* shift (-0.021 against -0.025), not a larger one. So that
+correction was already at full size, and the reasoning behind calling it a lower
+bound does not survive contact with the measurement — do not repeat it.
+
+What that settles: **calibration is not the explanation for the -0.047 CV-to-LB
+gap.** Both estimators agree the operating point only moves by ~0.02 on seed and
+0.008 on mask. The gap has to come from somewhere else — test-set annotator
+composition (unknown, unknowable without labels) and ordinary generalisation are
+the remaining candidates, and the second is the one worth attacking.
 
 Measuring both halves on the *same* images is the point, not an incidental
 detail: on a synthetic population 3x denser in filaments, transferring within
@@ -159,9 +166,12 @@ either population agrees to 0.004, while mixing them moves `mask_threshold` by
 0.19 — "correcting" a real difference in the sky as though it were an artefact
 of averaging. Asserted in `tests/test_pipeline.py`.
 
-The shift is smaller than expected (-0.025 on seed), so calibration probably does
-not explain the whole -0.047. Other candidates: test-set annotator composition
-(unknown), and ordinary generalisation gap.
+The predict kernel now selects its operating point by explicit name
+(`CONFIG_PREFERENCE` in `src/postprocess.py`, preferring `ensemble_config.json`
+over `oof_tuned.json`). Before that fix it *could not* have used a calibration
+even when one was attached: `ensemble_config.json` does not end in
+`_tuned.json`, so the glob that looked for configurations never saw it, and the
+run would have submitted the uncalibrated point looking entirely normal.
 
 ## Two newly-sanctioned levers (host replies, 4 days and 13 hours ago)
 
