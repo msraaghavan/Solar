@@ -323,11 +323,24 @@ def main() -> None:
     parser.add_argument("--amp-dtype", choices=AMP_CHOICES, default="auto",
                         help="autocast precision; 'auto' picks bf16 on Ampere and "
                              "later, fp16 on older cards such as the Kaggle T4")
+    parser.add_argument(
+        "--seed", type=int, default=1234,
+        help="base seed; the fold index is added to it.  Changing this is the "
+             "only way to measure run-to-run variance, which is what decides "
+             "whether a difference between two configurations means anything",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    torch.manual_seed(1234 + args.fold)
-    np.random.seed(1234 + args.fold)
+    # The fold index is added so that the five folds of one ensemble do not all
+    # start from identical weights.  --seed shifts the whole family: two runs of
+    # the same configuration at different seeds are the only measurement of
+    # run-to-run spread, and without that number a gap of 0.02 between two
+    # variants cannot be told apart from noise.
+    seed = args.seed + args.fold
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    print(f"seed {seed}", flush=True)
 
     train_dir = os.path.join(args.data_root, "train", "train_images")
     annotations = os.path.join(
@@ -364,6 +377,10 @@ def main() -> None:
         tiles_per_sample=args.tiles_per_sample,
         augment=True,
         with_spine=args.spine_weight > 0,
+        # Without this the dataset keeps its default seed, so every run draws
+        # the *same* tile positions and --seed would only vary weight init.
+        # Tile sampling is the larger source of run-to-run spread of the two.
+        seed=seed,
     )
     loader = DataLoader(
         dataset,

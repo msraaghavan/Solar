@@ -154,6 +154,10 @@ def launch(argv: argparse.Namespace, passthrough: list[str]) -> None:
         env[name] = value
     env["RUN_TAG"] = argv.tag
     env["MAX_HOURS"] = str(argv.hours)
+    # Two pods running the same configuration at different seeds is the only
+    # measurement of run-to-run spread, and that number is what says whether a
+    # difference between two variants is a result or noise.
+    env["SEED"] = str(argv.seed)
 
     args_line = " ".join(passthrough)
     body = {
@@ -226,6 +230,7 @@ def main() -> None:
     p.add_argument("--hours", type=int, default=6, help="wall-clock kill switch")
     p.add_argument("--disk", type=int, default=60)
     p.add_argument("--vcpus", type=int, default=12)
+    p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("list")
