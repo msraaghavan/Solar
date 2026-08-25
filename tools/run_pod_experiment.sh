@@ -40,17 +40,46 @@ SPINE_WEIGHTS=()
 FOLD=${FOLD:-0}
 EPOCHS=${EPOCHS:-30}
 ENCODER=${ENCODER:-tf_efficientnet_b0}
+BASELINE=${BASELINE:-1}    # also run spine-weight 0 on this pod; see below
+SMOKE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --spine)  SPINE_WEIGHTS+=("$2"); shift 2 ;;
         --fold)   FOLD="$2";   shift 2 ;;
         --epochs) EPOCHS="$2"; shift 2 ;;
+        --encoder) ENCODER="$2"; shift 2 ;;
+        --no-baseline) BASELINE=0; shift ;;
+        --smoke)  SMOKE=1; shift ;;
         --keep-alive) KEEP_ALIVE=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 [ ${#SPINE_WEIGHTS[@]} -eq 0 ] && SPINE_WEIGHTS=(0.3)
+
+# --smoke: one epoch, five steps, two validation files.  Costs a few cents and
+# exercises every path that can fail after an hour of billing - the spine
+# preflight, a real training step, a full-disk inference, instance extraction,
+# the checkpoint round-trip and the result push.  Run this first, always.
+if [ "$SMOKE" = "1" ]; then
+    EPOCHS=1
+    SMOKE_ARGS=(--max-steps 5 --val-every 1 --val-files 2)
+    MAX_HOURS=1
+    echo "=== SMOKE RUN: 1 epoch, 5 steps. Validates the pipeline, not the model. ==="
+else
+    SMOKE_ARGS=()
+fi
+
+# A spine run on its own cannot answer the question it is asked.  Fold 0's
+# baseline of 0.4387 was measured with different code, on a T4, in fp16; this
+# pod is different code, on a different card, in bf16.  Comparing across that is
+# how label smoothing once looked like a +0.022 gain when it was a -0.011 loss.
+# So the baseline is re-run here, in the same pod and the same precision, and
+# the comparison is against *that*.  It doubles the cost of the experiment and
+# is the only thing that makes the result mean anything.
+if [ "$BASELINE" = "1" ]; then
+    SPINE_WEIGHTS=(0 "${SPINE_WEIGHTS[@]}")
+fi
 
 STARTED=$(date +%s)
 SUMMARY="$ARTIFACT_DIR/pod_summary.txt"
@@ -171,11 +200,13 @@ echo "run started $(date -u +%FT%TZ)" > "$SUMMARY"
 
 for weight in "${SPINE_WEIGHTS[@]}"; do
     echo ""
-    echo "=== fold $FOLD, spine-weight $weight ==="
+    echo "=== fold $FOLD, encoder $ENCODER, spine-weight $weight ==="
+    default_val=(--val-every 3 --val-files 40)
+    [ "$SMOKE" = "1" ] && default_val=()
     python src/train.py \
         --fold "$FOLD" --encoder "$ENCODER" \
         --tile-size 512 --batch-size 8 --tiles-per-sample 8 \
-        --epochs "$EPOCHS" --val-every 3 --val-files 40 \
+        --epochs "$EPOCHS" "${default_val[@]}" "${SMOKE_ARGS[@]}" \
         --workers "$WORKERS" --spine-weight "$weight" \
         --out-dir "$ARTIFACT_DIR" 2>&1 | tee "$ARTIFACT_DIR/train_spine${weight}.log"
 
@@ -195,8 +226,20 @@ for weight in "${SPINE_WEIGHTS[@]}"; do
 
     pq=$(grep -oE '"pq_micro":[[:space:]]*[0-9.]+' "$ARTIFACT_DIR/eval_spine${weight}.log" \
          | tail -1 | grep -oE '[0-9.]+$')
-    echo "spine=$weight  PQ=${pq:-unknown}  (fold $FOLD baseline 0.4387)" >> "$SUMMARY"
+    label="spine=$weight"
+    [ "$weight" = "0" ] && label="baseline (spine off)"
+    echo "$label  PQ=${pq:-unknown}" >> "$SUMMARY"
 done
+
+if [ "$BASELINE" = "1" ]; then
+    cat >> "$SUMMARY" <<'NOTE'
+
+Compare every spine row against the baseline row ABOVE, not against 0.4387.
+That figure was measured on a T4 in fp16 under older code; this pod is none of
+those three things, and comparing across them is how a -0.011 loss once read as
+a +0.022 gain.
+NOTE
+fi
 
 echo ""
 echo "=== summary ==="
