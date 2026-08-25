@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Run an experiment queue on a rented pod, then STOP BILLING - whatever happens.
+#
+# Usage, from the pod's shell (or as the pod's docker command):
+#
+#     export RUNPOD_API_KEY=...            # only needed if runpodctl is absent
+#     export GITHUB_TOKEN=...              # only needed to push results back
+#     bash tools/run_pod_experiment.sh --spine 0.3
+#
+# `bootstrap_pod.sh` prepares a pod and stops at a shell prompt, which is the
+# right shape when a human is watching and the wrong one when nobody is.  A pod
+# that finishes its job and keeps running bills at the same rate as one that is
+# training, so the single most expensive failure mode here is not a bad
+# hyperparameter - it is a successful run nobody noticed had finished.
+#
+# Three things therefore hold unconditionally:
+#
+#   1. Termination runs from a trap, so it fires on success, on a crash, on a
+#      failed job, and on Ctrl-C.  It is not the last line of the happy path.
+#   2. A wall-clock watchdog kills the pod even if the training process wedges
+#      somewhere a trap cannot see.
+#   3. Results are pushed *before* termination, never after.  A pod that has
+#      billed for two hours and produced nothing recoverable is the whole loss.
+#
+# What does NOT survive a pod: anything outside a network volume.  Checkpoints
+# are ~50 MB each and gitignored, so if the five-fold ensemble is the goal,
+# mount a network volume and set ARTIFACT_DIR to a path on it - otherwise the
+# folds train, report their PQ, and evaporate.
+
+set -uo pipefail   # deliberately not -e: a failed job must still reach cleanup
+
+REPO=${REPO:-https://github.com/msraaghavan/Solar.git}
+WORK=${WORK:-/workspace}
+ARTIFACT_DIR=${ARTIFACT_DIR:-$WORK/artifacts}
+RESULT_BRANCH=${RESULT_BRANCH:-pod-results}
+MAX_HOURS=${MAX_HOURS:-6}
+KEEP_ALIVE=${KEEP_ALIVE:-0}       # 1 = do not terminate (debugging only)
+
+SPINE_WEIGHTS=()
+FOLD=${FOLD:-0}
+EPOCHS=${EPOCHS:-30}
+ENCODER=${ENCODER:-tf_efficientnet_b0}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --spine)  SPINE_WEIGHTS+=("$2"); shift 2 ;;
+        --fold)   FOLD="$2";   shift 2 ;;
+        --epochs) EPOCHS="$2"; shift 2 ;;
+        --keep-alive) KEEP_ALIVE=1; shift ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+[ ${#SPINE_WEIGHTS[@]} -eq 0 ] && SPINE_WEIGHTS=(0.3)
+
+STARTED=$(date +%s)
+SUMMARY="$ARTIFACT_DIR/pod_summary.txt"
+
+# --------------------------------------------------------------------------- #
+# Termination.  Everything below exists to make this run exactly once, always.
+# --------------------------------------------------------------------------- #
+
+terminate_pod() {
+    if [ "$KEEP_ALIVE" = "1" ]; then
+        echo "!!! KEEP_ALIVE=1: pod left running and BILLING. Remove it yourself."
+        return
+    fi
+    local id="${RUNPOD_POD_ID:-}"
+    if [ -z "$id" ]; then
+        echo "!!! RUNPOD_POD_ID is unset - cannot self-terminate. REMOVE THIS POD MANUALLY."
+        return
+    fi
+
+    echo "=== terminating pod $id ==="
+    if command -v runpodctl >/dev/null 2>&1; then
+        runpodctl remove pod "$id" && return
+        echo "runpodctl failed; falling back to the REST API"
+    fi
+
+    if [ -n "${RUNPOD_API_KEY:-}" ]; then
+        # The key goes in via a header file rather than on the command line:
+        # arguments are world-readable in /proc on a shared host.
+        local hdr; hdr=$(mktemp); chmod 600 "$hdr"
+        printf 'Authorization: Bearer %s\n' "$RUNPOD_API_KEY" > "$hdr"
+        curl -s -X DELETE "https://rest.runpod.io/v1/pods/$id" -H @"$hdr" >/dev/null
+        rm -f "$hdr"
+    else
+        echo "!!! no runpodctl and no RUNPOD_API_KEY. REMOVE THIS POD MANUALLY."
+    fi
+}
+
+push_results() {
+    [ -f "$SUMMARY" ] || return 0
+    echo "=== pushing results to $RESULT_BRANCH ==="
+    cd "$WORK/Solar" || return 0
+    mkdir -p results
+    cp -f "$SUMMARY" results/ 2>/dev/null
+    cp -f "$ARTIFACT_DIR"/fold*_history.json results/ 2>/dev/null
+    cp -f "$ARTIFACT_DIR"/*_tuned.json       results/ 2>/dev/null
+
+    if [ -z "${GITHUB_TOKEN:-}" ]; then
+        echo "no GITHUB_TOKEN; results stay on the pod only:"
+        cat "$SUMMARY"
+        return 0
+    fi
+    git config user.email "pod@localhost"
+    git config user.name  "runpod"
+    git checkout -B "$RESULT_BRANCH" >/dev/null 2>&1
+    git add -f results
+    git commit -q -m "Pod results: fold $FOLD, spine ${SPINE_WEIGHTS[*]}" 2>/dev/null
+    git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/msraaghavan/Solar.git" \
+        "$RESULT_BRANCH" 2>&1 | sed 's/x-access-token:[^@]*@/x-access-token:***@/g'
+}
+
+# Ctrl-C fires the INT trap *and then* the EXIT trap, so an unguarded handler
+# pushes twice and issues two terminate calls (verified, not assumed).  Run once.
+CLEANED=0
+cleanup() {
+    local code=$?
+    [ "$CLEANED" = "1" ] && return
+    CLEANED=1
+    # Kill the sleep first, then its subshell.  A bare `sleep` may still be
+    # orphaned here; that is harmless, because the `&&` below means a sleep that
+    # did not run to completion never reaches the terminate call, and the pod is
+    # destroyed moments later anyway.
+    if [ -n "${WATCHDOG:-}" ]; then
+        pkill -P "$WATCHDOG" 2>/dev/null
+        kill "$WATCHDOG" 2>/dev/null
+    fi
+    echo ""
+    echo "=== cleanup (exit $code, $(( ($(date +%s) - STARTED) / 60 )) min elapsed) ==="
+    push_results
+    terminate_pod
+}
+
+# The watchdog covers what the trap cannot: a wedged CUDA call, a hung mount, a
+# dataloader deadlock.  None of those return control to this shell, and all of
+# them bill.  A background subshell does not run the parent's EXIT trap (checked),
+# so this terminates directly rather than going through cleanup.
+#
+# `&&`, not `;`.  With `;` a sleep killed during cleanup falls through to the
+# next command, so tearing the watchdog down would *fire* it - the exact inverse
+# of the intent.  Short-circuiting on the sleep's exit status is what makes
+# cancellation mean cancellation.
+( sleep $(( MAX_HOURS * 3600 )) && {
+      echo "!!! watchdog: ${MAX_HOURS}h wall clock exceeded, terminating"
+      terminate_pod
+  } ) &
+WATCHDOG=$!
+
+trap cleanup EXIT INT TERM
+
+# --------------------------------------------------------------------------- #
+# Setup
+# --------------------------------------------------------------------------- #
+
+mkdir -p "$ARTIFACT_DIR"
+cd "$WORK"
+[ -d Solar ] || git clone -q "$REPO"
+cd Solar
+git pull -q 2>/dev/null
+
+bash tools/bootstrap_pod.sh || { echo "bootstrap failed"; exit 1; }
+
+WORKERS=$(( $(nproc) > 16 ? 16 : $(nproc) ))
+echo "run started $(date -u +%FT%TZ)" > "$SUMMARY"
+
+# --------------------------------------------------------------------------- #
+# The queue.  Each job appends one line to the summary, so a pod that dies
+# halfway still reports what it managed.
+# --------------------------------------------------------------------------- #
+
+for weight in "${SPINE_WEIGHTS[@]}"; do
+    echo ""
+    echo "=== fold $FOLD, spine-weight $weight ==="
+    python src/train.py \
+        --fold "$FOLD" --encoder "$ENCODER" \
+        --tile-size 512 --batch-size 8 --tiles-per-sample 8 \
+        --epochs "$EPOCHS" --val-every 3 --val-files 40 \
+        --workers "$WORKERS" --spine-weight "$weight" \
+        --out-dir "$ARTIFACT_DIR" 2>&1 | tee "$ARTIFACT_DIR/train_spine${weight}.log"
+
+    checkpoint="$ARTIFACT_DIR/fold${FOLD}_best.pt"
+    if [ ! -f "$checkpoint" ]; then
+        echo "spine=$weight  FAILED (no checkpoint)" >> "$SUMMARY"
+        continue
+    fi
+    mv "$checkpoint" "$ARTIFACT_DIR/fold${FOLD}_spine${weight}.pt"
+
+    # Score it the same way fold 0's 0.4387 baseline was scored.  Comparing to
+    # anything measured under a different code version is how label smoothing
+    # once looked like a +0.022 gain when it was a loss.
+    python src/evaluate_fold.py \
+        --checkpoint "$ARTIFACT_DIR/fold${FOLD}_spine${weight}.pt" \
+        --fold "$FOLD" 2>&1 | tee "$ARTIFACT_DIR/eval_spine${weight}.log"
+
+    pq=$(grep -oE '"pq_micro":[[:space:]]*[0-9.]+' "$ARTIFACT_DIR/eval_spine${weight}.log" \
+         | tail -1 | grep -oE '[0-9.]+$')
+    echo "spine=$weight  PQ=${pq:-unknown}  (fold $FOLD baseline 0.4387)" >> "$SUMMARY"
+done
+
+echo ""
+echo "=== summary ==="
+cat "$SUMMARY"
