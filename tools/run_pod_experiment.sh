@@ -69,10 +69,16 @@ done
 if [ "$SMOKE" = "1" ]; then
     EPOCHS=1
     SMOKE_ARGS=(--max-steps 5 --val-every 1 --val-files 2)
+    # evaluate_fold scores the whole fold and tunes over the grid by default -
+    # ~141 full-disk inferences at TTA 4, which is far and away the longest part
+    # of a smoke run and tests nothing that four images do not.  Cap it, or the
+    # cheap preflight costs most of an hour.
+    EVAL_ARGS=(--max-files 4 --tta 1)
     MAX_HOURS=1
     echo "=== SMOKE RUN: 1 epoch, 5 steps. Validates the pipeline, not the model. ==="
 else
     SMOKE_ARGS=()
+    EVAL_ARGS=()
 fi
 
 # A spine run on its own cannot answer the question it is asked.  Fold 0's
@@ -325,7 +331,7 @@ for job in "${JOBS[@]}"; do
     python src/evaluate_fold.py \
         --checkpoint "$ARTIFACT_DIR/fold${FOLD}_${tag}.pt" \
         --fold "$FOLD" \
-        --out "$ARTIFACT_DIR/fold${FOLD}_${tag}_tuned.json" \
+        --out "$ARTIFACT_DIR/fold${FOLD}_${tag}_tuned.json" "${EVAL_ARGS[@]}" \
         2>&1 | tee "$ARTIFACT_DIR/eval_${tag}.log"
 
     pq=$(grep -oE '"pq_micro":[[:space:]]*[0-9.]+' "$ARTIFACT_DIR/eval_${tag}.log" \
