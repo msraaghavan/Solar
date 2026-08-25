@@ -31,24 +31,31 @@ cd "$WORK"
 cd Solar
 
 python -m pip install -q --upgrade pip
-# requirements.txt pins the Kaggle T4 runtime the submitted results came from.
-# A pod usually ships its own torch; reinstalling the pinned build over a
-# different CUDA runtime is the classic way to end up with a torch that imports
-# and then fails on the first kernel launch.  Keep the pod's torch, pin the rest.
-python - <<'PY'
-import re
-keep = []
-for line in open("requirements.txt"):
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    if re.match(r"^(torch|torchvision)==", line):
-        continue
-    keep.append(line)
-open("/tmp/reqs-nopod-torch.txt", "w").write("\n".join(keep) + "\n")
-print("installing:", ", ".join(keep))
-PY
-python -m pip install -q -r /tmp/reqs-nopod-torch.txt
+
+# What the code actually imports, across all of src/ and tests/: cv2, numpy,
+# pycocotools, torch and timm.  scipy, scikit-image, pandas and matplotlib are in
+# requirements.txt because that file documents the *Kaggle* runtime the submitted
+# results came from, where they are already present - nothing here imports them.
+#
+# Installing them anyway is not free.  Every extra package is another chance for
+# the resolver to move torch, and moving torch is fatal in a way that is not
+# obvious from the error: pip pulled torch 2.13.0+cu130 from PyPI over the
+# image's 2.9.1+cu129, it imported perfectly, and then reported *no CUDA device*
+# because the host driver is 12.9.  Stripping the "torch==" lines out of
+# requirements.txt did not prevent that, because timm *depends* on torch and pip
+# is free to satisfy that by upgrading it.
+#
+# So: keep the pod's torch, install timm without its dependencies, and add back
+# only the ones that are not torch.
+TORCH_BEFORE=$(python -c "import torch; print(torch.__version__)")
+echo "pod torch: $TORCH_BEFORE  (this must not change)"
+
+python -m pip install -q --no-deps timm==1.0.26
+# timm's runtime dependencies other than torch/torchvision.  huggingface_hub and
+# safetensors are what fetch and load the pretrained encoder weights, so
+# --no-deps without these gets you a timm that fails at create_model(pretrained).
+python -m pip install -q pyyaml huggingface_hub safetensors
+python -m pip install -q opencv-python-headless==4.13.0.90 pycocotools==2.0.10
 
 # The Kaggle CLI is deliberately not in requirements.txt: that file documents the
 # runtime the submitted results were produced *on*, and the competition image
@@ -56,6 +63,16 @@ python -m pip install -q -r /tmp/reqs-nopod-torch.txt
 # fetch the data below, and to publish results and checkpoints afterwards, which
 # is the only way anything survives an ephemeral pod.
 python -m pip install -q kaggle
+
+TORCH_AFTER=$(python -c "import torch; print(torch.__version__)")
+if [ "$TORCH_BEFORE" != "$TORCH_AFTER" ]; then
+    echo "!!! torch moved from $TORCH_BEFORE to $TORCH_AFTER while installing deps."
+    echo "!!! That is the exact failure the --no-deps above exists to prevent:"
+    echo "!!! a PyPI build compiled against a newer CUDA than this host's driver"
+    echo "!!! imports cleanly and then sees no GPU at all."
+    exit 1
+fi
+echo "torch unchanged at $TORCH_AFTER"
 
 python - <<'PY'
 import torch
@@ -84,7 +101,7 @@ python src/build_disk_cache.py --root "$DATA/MAGFiLO_1.0_Kaggle_2026"
 python tests/test_pipeline.py
 python tests/test_official_metric.py
 
-WORKERS=$(( $(nproc) > 16 ? 16 : $(nproc) ))
+WORKERS=$(( $(nproc) > 32 ? 32 : $(nproc) ))
 cat <<EOF
 
 === ready ===

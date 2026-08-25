@@ -269,7 +269,12 @@ git pull -q 2>/dev/null
 
 bash tools/bootstrap_pod.sh || { echo "bootstrap failed"; exit 1; }
 
-WORKERS=$(( $(nproc) > 16 ? 16 : $(nproc) ))
+# Training was measured input-bound on the T4, so the loader - not the card -
+# sets the epoch time, and workers is the cheapest lever on the whole bill.  The
+# first pod reported 96 vCPUs and 251 GB, against the Kaggle image's 4 workers;
+# the cap is 32 rather than nproc because DataLoader workers each hold decoded
+# tiles and the returns flatten well before 96.
+WORKERS=$(( $(nproc) > 32 ? 32 : $(nproc) ))
 {
     echo "run started $(date -u +%FT%TZ)"
     echo "gpu: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
