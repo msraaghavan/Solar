@@ -235,13 +235,41 @@ Two rules the runner enforces, both of which cost money to learn otherwise:
    same pod.** Fold 0's 0.4387 was measured under older code, on a T4, in fp16.
    A pod is none of those three. Compare against the paired row, never 0.4387.
 
-**Checkpoints do not survive a pod** — they are ~50 MB and gitignored. For the
-five-fold ensemble, mount a network volume and point `ARTIFACT_DIR` at it, or
-the folds train, report their PQ and evaporate.
+**Checkpoints do not survive a pod** — they are ~50 MB and gitignored. This is
+now solved without a network volume: the runner publishes everything, including
+the `.pt` files, to a **Kaggle dataset** `raaghavanms/filament-pod-<tag>`. That
+is strictly better than a volume, because a Kaggle dataset can be attached to
+the prediction kernel through `dataset_sources` — so a fold trained on rented
+hardware is immediately usable on Kaggle, with no upload step in between.
 
-## Tests — 47 checks, all passing
+Three things learned by spending money, all of them now handled in code:
 
-`python tests/test_pipeline.py` (40) and `python tests/test_official_metric.py`
+- **There is no GitHub token on this account.** The runner's original
+  `git push` path was dead code, so every result would have evaporated with the
+  pod. Kaggle is the transport; git remains as an optional extra if a token ever
+  appears in `GITHUB_TOKEN`.
+- **RunPod's REST API cannot read a running pod's console, and a terminated pod
+  takes its logs with it.** The first pod died four minutes in and reported
+  *nothing*. `tools/launch_pod.py` now redirects the whole pod session to a file
+  and uploads it to `raaghavanms/pod-<tag>-log` from the exit trap, before
+  destroying the pod. Read that dataset first when a pod fails.
+- **`/workspace` is the default *volume* mount point, and these pods are created
+  with no volume**, so it is not guaranteed to exist; `mkdir -p` it before use.
+
+`tools/launch_pod.py launch|list|kill` drives the whole thing. Secrets come from
+the environment (`RUNPOD_API_KEY`, `KAGGLE_USERNAME`, `KAGGLE_KEY`) and are never
+printed, never passed as arguments, and never committed. `list` shows what is
+billing; `kill all` stops everything.
+
+Pricing checked 25 Aug 2026 on Community: **RTX 4090 $0.34/h, High stock**;
+3090 $0.22/h Medium; A40 $0.35/h High. All three are Ampere-or-later and have
+native bf16, which is the entire reason to rent rather than use the Kaggle T4.
+$20 is roughly **58 GPU-hours** at 4090 prices, so the binding constraint on
+these experiments is wall-clock and attention, not money.
+
+## Tests — 48 checks, all passing
+
+`python tests/test_pipeline.py` (41) and `python tests/test_official_metric.py`
 (7). No pytest needed. Runs in ~4 s on CPU. Several encode real bugs:
 
 - the tuning grid must bracket every fitted value **and** every fitted value in
@@ -255,7 +283,11 @@ the folds train, report their PQ and evaporate.
   floor (a step-function tail means whole ranges of thresholds admit the same
   pixels), and both its histograms must come from one image population;
 - the spine target must parse whatever nesting COCO used, must sit on its own
-  filament, and must reach the loss only when `--spine-weight` is set.
+  filament, and must reach the loss only when `--spine-weight` is set;
+- the operating point a submission uses must be chosen by an explicit name, never
+  by sort order, and the list of names must include `ensemble_config.json` —
+  which does *not* end in `_tuned.json` and so was invisible to the glob that
+  looked for one.
 
 Note that "every fitted value sits inside its grid" checks **0 values** unless
 `kernels/_runs/` is present — it walks the run artefacts, which are gitignored.
