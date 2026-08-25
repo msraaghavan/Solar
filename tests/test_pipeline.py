@@ -779,6 +779,48 @@ def _():
     os.rmdir(image_dir)
 
 
+@check("autocast picks bf16 on Ampere and leaves the T4 exactly as it was")
+def _():
+    import torch
+
+    from infer import choose_amp_dtype
+
+    # Every autocast site used to take torch's CUDA default, which is fp16.  On
+    # the T4 that is right.  On a rented 3090 it silently reproduces the fp16
+    # overflow that made EfficientNet-B4 train with skipped steps - the caveat
+    # standing against the one capacity measurement this project has.
+    assert choose_amp_dtype("auto", "cuda", (7, 5)) is torch.float16, "T4 must not change"
+    assert choose_amp_dtype("auto", "cuda", (8, 6)) is torch.bfloat16, "Ampere"
+    assert choose_amp_dtype("auto", "cuda", (8, 9)) is torch.bfloat16, "Ada"
+    assert choose_amp_dtype("auto", "cuda", (9, 0)) is torch.bfloat16, "Hopper"
+    assert choose_amp_dtype("auto", "cpu", None) is None
+    assert choose_amp_dtype("fp32", "cuda", (8, 6)) is None
+    assert choose_amp_dtype("fp16", "cuda", (8, 6)) is torch.float16, "override honoured"
+
+    # Selection must come from compute capability, not
+    # torch.cuda.is_bf16_supported(), which reports True for *emulated* bf16 on
+    # pre-Ampere cards and would put the T4 on a slow path.
+    import inspect
+
+    source = inspect.getsource(choose_amp_dtype)
+    assert "is_bf16_supported" not in source.split('"""')[2], (
+        "capability, not is_bf16_supported, decides"
+    )
+
+    try:
+        choose_amp_dtype("float16", "cuda", (8, 6))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown precision name must be rejected, not guessed")
+
+    # bf16 is the point: fp32's range, and a mantissa still finer than the
+    # uint8 quantisation the tuning path already rounds probabilities to.
+    assert torch.finfo(torch.bfloat16).max > 1e38
+    assert torch.finfo(torch.float16).max < 1e5
+    assert 2 ** -8 <= 1.0 / 255
+
+
 @check("post-processing defaults match the configuration fitted against PQ")
 def _():
     # Training validates with these defaults, so a stale value would select the

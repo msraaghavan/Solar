@@ -55,7 +55,7 @@ import numpy as np
 import torch
 
 from data import ImageContext, load_contexts, load_samples, make_folds
-from infer import disk_mask_for, predict_full
+from infer import AMP_CHOICES, disk_mask_for, predict_full
 from model import FilamentNet
 from postprocess import PostprocessConfig
 from preprocess import detect_disk
@@ -120,6 +120,8 @@ def main() -> None:
     )
     parser.add_argument("--out", default="artifacts/ensemble_config.json")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--amp-dtype", choices=AMP_CHOICES, default="auto",
+                        help="autocast precision; 'auto' picks bf16 on Ampere and later")
     args = parser.parse_args()
 
     with open(args.config) as fh:
@@ -163,7 +165,8 @@ def main() -> None:
         n_pixels = int(on_disk.sum())
 
         maps = {
-            fold: predict_full(model, image, context, tta=args.tta, device=args.device)
+            fold: predict_full(model, image, context, tta=args.tta,
+                                 device=args.device, amp_dtype=args.amp_dtype)
             for fold, model in models.items()
         }
 

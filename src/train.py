@@ -38,7 +38,7 @@ from data import (
     spine_alignment,
 )
 from dataset_torch import FilamentTiles
-from infer import disk_mask_for, predict_full
+from infer import AMP_CHOICES, amp_dtype_for, disk_mask_for, predict_full
 from losses import FilamentLoss
 from metrics import evaluate, evaluate_image, format_report
 from model import FilamentNet
@@ -84,6 +84,7 @@ def validate(
     device: str,
     tta: int = 1,
     max_files: int | None = None,
+    amp_dtype: str = "auto",
 ) -> dict:
     """Full-disk PQ over held-out observations, averaged across annotators."""
     by_file: dict[str, list[Sample]] = {}
@@ -110,7 +111,7 @@ def validate(
         image = cv2.imread(os.path.join(image_dir, file_name), cv2.IMREAD_GRAYSCALE)
         context = contexts[file_name]
         probability = predict_full(
-            model, image, context, tta=tta, device=device
+            model, image, context, tta=tta, device=device, amp_dtype=amp_dtype
         )
         on_disk = disk_mask_for(context)
         instances = extract_instances(probability, config, on_disk)
@@ -179,6 +180,7 @@ def preflight(
     contexts: dict[str, ImageContext],
     device: str,
     epochs: int,
+    amp_dtype: str = "auto",
 ) -> None:
     """Exercise every path that can fail silently, before committing hours to a run.
 
@@ -192,7 +194,8 @@ def preflight(
     known up front rather than discovered three hours later.
     """
     print("--- preflight ---", flush=True)
-    amp = device.startswith("cuda")
+    dtype = amp_dtype_for(amp_dtype, device)
+    print(f"  autocast: {dtype if dtype is not None else 'disabled (fp32)'}", flush=True)
 
     # 0. The auxiliary spine target, if it is switched on.  This path had never
     # run against real annotations, and every way of misreading the field fails
@@ -230,7 +233,11 @@ def preflight(
     step_time = float("inf")
     for _ in range(3):
         t0 = time.time()
-        with torch.autocast(device_type=device.split(":")[0], enabled=amp):
+        with torch.autocast(
+            device_type=device.split(":")[0],
+            dtype=dtype or torch.float32,
+            enabled=dtype is not None,
+        ):
             loss = criterion(model(features), target, weight)
         loss.backward()
         if device.startswith("cuda"):
@@ -253,7 +260,9 @@ def preflight(
     file_name = sorted({s.file_name for s in val_samples})[0]
     image = cv2.imread(os.path.join(image_dir, file_name), cv2.IMREAD_GRAYSCALE)
     t0 = time.time()
-    probability = predict_full(model, image, contexts[file_name], tta=1, device=device)
+    probability = predict_full(
+        model, image, contexts[file_name], tta=1, device=device, amp_dtype=amp_dtype
+    )
     infer_time = time.time() - t0
     instances = extract_instances(
         probability, PostprocessConfig(), disk_mask_for(contexts[file_name])
@@ -311,6 +320,9 @@ def main() -> None:
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-steps", type=int, default=0, help="debug: cap steps/epoch")
+    parser.add_argument("--amp-dtype", choices=AMP_CHOICES, default="auto",
+                        help="autocast precision; 'auto' picks bf16 on Ampere and "
+                             "later, fp16 on older cards such as the Kaggle T4")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -392,10 +404,17 @@ def main() -> None:
         total_steps=args.epochs * steps_per_epoch,
         pct_start=0.1,
     )
-    scaler = torch.amp.GradScaler(enabled=args.device.startswith("cuda"))
+    # Loss scaling exists to keep fp16 gradients off the bottom of its range.
+    # bf16 has fp32's exponent range and needs none of it, and leaving the scaler
+    # on there would make the AMP-SKIPPED diagnostic below meaningless - it can
+    # only ever report zero, which reads as "no overflow" rather than "not
+    # applicable".
+    amp_dtype = amp_dtype_for(args.amp_dtype, args.device)
+    scaler = torch.amp.GradScaler(enabled=amp_dtype == torch.float16)
 
     preflight(
-        model, criterion, loader, val_samples, train_dir, contexts, args.device, args.epochs
+        model, criterion, loader, val_samples, train_dir, contexts, args.device,
+        args.epochs, args.amp_dtype,
     )
 
     best_pq = -1.0
@@ -415,7 +434,8 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=args.device.split(":")[0],
-                enabled=args.device.startswith("cuda"),
+                dtype=amp_dtype or torch.float32,
+                enabled=amp_dtype is not None,
             ):
                 loss = criterion(model(features), target, weight)
             scaler.scale(loss).backward()
@@ -462,6 +482,7 @@ def main() -> None:
                 args.device,
                 tta=1,
                 max_files=args.val_files,
+                amp_dtype=args.amp_dtype,
             )
             message += (
                 f"  |  val PQ {report['pq_micro']:.4f} (SQ {report['sq']:.3f} "
