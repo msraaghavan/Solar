@@ -836,6 +836,43 @@ def _():
     assert c.mask_threshold < c.seed_threshold, "hysteresis needs a looser extent than seed"
 
 
+@check("the spine target lands on real filaments, when the data is present")
+def _():
+    # The fixtures above prove spine_points parses every nesting and that a
+    # transposed convention is detected.  Neither can prove the *real* file is
+    # read correctly - only the real annotations can, and they are gitignored, so
+    # this check is data-gated like the artefact one above and passes vacuously
+    # in a fresh clone.  It reports the count it measured.
+    #
+    # Worth having as a test rather than a one-off measurement: every way of
+    # misreading the spine field fails silently to a target the model can still
+    # fit, so the loss curve looks healthy and the experiment reports "spine does
+    # not help" having never tested it.  The published alignment is 95.4%.
+    annotations = (
+        "data/MAGFiLO_1.0_Kaggle_2026/train/"
+        "MAGFiLO_1.0_Annotations_kaggle2026_train.json"
+    )
+    if not os.path.exists(annotations):
+        print("      (no data present; spine alignment not measured)", end="")
+        return
+
+    from data import load_samples, spine_alignment
+
+    readings = [s for s in load_samples(annotations) if s.instances]
+    step = max(len(readings) // 40, 1)
+    chosen = readings[::step][:40]
+    scores = [spine_alignment(s) for s in chosen]
+    inside = float(np.mean([a for a, _ in scores]))
+    empty = sum(1 for a, _ in scores if a == 0.0)
+
+    assert empty == 0, f"{empty}/{len(chosen)} readings rasterised to an empty spine"
+    assert inside > 0.90, (
+        f"only {inside:.1%} of spine pixels fall inside their own filament "
+        f"(published figure 95.4%); the spine field is being misread"
+    )
+    print(f"      ({inside:.1%} alignment over {len(chosen)} readings)", end="")
+
+
 @check("the submitted operating point is chosen by name, never by sort order")
 def _():
     # Both halves of this have already gone wrong once.  Sort order picked
