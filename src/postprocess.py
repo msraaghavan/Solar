@@ -47,6 +47,7 @@ threshold.
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, replace
 from typing import Iterable, Sequence
 
@@ -127,6 +128,42 @@ class PostprocessConfig:
 # therefore extends past every value any fold has selected, so that an interior
 # optimum can be observed rather than assumed.  ``dilate_radius`` and
 # ``open_radius`` are unchanged: no fold has come near their ceilings.
+# The operating point a submission is generated with, chosen by name.  Most
+# specific first; anything not on this list is only used when it is the sole
+# candidate attached.
+#
+# This exists as a named list because choosing by sort order was a real bug that
+# reached a submission: "fold0_tuned.json" precedes "oof_tuned.json"
+# alphabetically, so the first glob match was a per-fold configuration fitted on
+# 143 images against a grid censored at its own ceiling, standing in for the
+# pooled fit worth +0.020 to +0.032 over it.
+#
+# ensemble_config.json outranks oof_tuned.json because it *is* oof_tuned.json,
+# moved onto the distribution it is actually applied to: the out-of-fold point
+# is fitted on single-model maps, while a submission averages five models, and
+# averaging shaves probability peaks so the same threshold admits less.  Note it
+# does not end in _tuned.json, so a glob for that pattern alone will not even see
+# it - the calibration would be attached, ignored, and the run would look normal.
+CONFIG_PREFERENCE = ("ensemble_config.json", "oof_tuned.json")
+
+
+def choose_config(paths: Sequence[str]) -> str | None:
+    """Pick the operating point to submit with, or raise rather than guess."""
+    by_name: dict[str, str] = {}
+    for path in paths:
+        by_name.setdefault(os.path.basename(path), path)
+    for name in CONFIG_PREFERENCE:
+        if name in by_name:
+            return by_name[name]
+    if len(by_name) <= 1:
+        return next(iter(by_name.values()), None)
+    raise SystemExit(
+        f"none of {CONFIG_PREFERENCE} among the attached sources, and several "
+        f"configurations to choose between: {sorted(by_name)}. "
+        "Attach the calibration or out-of-fold kernel, or attach exactly one."
+    )
+
+
 TUNING_GRIDS: dict[str, Iterable] = {
     # Extended twice now.  The five folds pinned 0.70; the widened grid was then
     # pinned at 0.95 by the pooled out-of-fold fit, still gaining at every step.

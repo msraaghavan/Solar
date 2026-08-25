@@ -39,30 +39,23 @@ if not checkpoints:
 if not checkpoints:
     raise SystemExit("no checkpoints found among attached sources")
 
-candidates = sorted(glob.glob("/kaggle/input/**/*_tuned.json", recursive=True))
+# The selection rule lives in src/postprocess.py so that the test suite exercises
+# the same code this kernel runs, rather than a copy of it that can drift.
+from postprocess import CONFIG_PREFERENCE, choose_config  # noqa: E402
 
-# Choosing the operating point by sort order is how the wrong one gets used:
-# "fold0_tuned.json" precedes "oof_tuned.json" alphabetically, so taking the
-# first match would silently submit a per-fold configuration - fitted on 143
-# images against a grid that was censored at its own ceiling - in place of the
-# pooled one.  Prefer the out-of-fold fit explicitly, and refuse to guess when
-# it is absent but several per-fold configurations are attached.
-oof = [c for c in candidates if os.path.basename(c) == "oof_tuned.json"]
-if oof:
-    configs = oof
-elif len(candidates) <= 1:
-    configs = candidates
-else:
-    raise SystemExit(
-        "no oof_tuned.json among the attached sources, and several per-fold "
-        f"configurations to choose between: {[os.path.basename(c) for c in candidates]}. "
-        "Attach the out-of-fold kernel, or attach exactly one configuration."
-    )
+candidates = sorted(
+    glob.glob("/kaggle/input/**/*_tuned.json", recursive=True)
+    + glob.glob("/kaggle/input/**/ensemble_config.json", recursive=True)
+)
+chosen = choose_config(candidates)
+configs = [chosen] if chosen else []
 
 print("SRC        =", SRC, flush=True)
 print("DATA_ROOT  =", DATA_ROOT, flush=True)
 print("checkpoints=", checkpoints, flush=True)
 print("config     =", configs[0] if configs else "(defaults)", flush=True)
+print("preference =", CONFIG_PREFERENCE, flush=True)
+print("candidates =", [os.path.basename(c) for c in candidates], flush=True)
 
 TTA = int(os.environ.get("TTA", "4"))
 

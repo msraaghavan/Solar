@@ -33,7 +33,12 @@ from data import (  # noqa: E402
     stride_split,
 )
 import postprocess  # noqa: E402
-from postprocess import PostprocessConfig, extract_instances, marginal_threshold  # noqa: E402
+from postprocess import (  # noqa: E402
+    PostprocessConfig,
+    choose_config,
+    extract_instances,
+    marginal_threshold,
+)
 from preprocess import Disk, detect_disk, flat_field, limb_profile  # noqa: E402
 from submit import rle_to_counts, validate_submission, write_submission  # noqa: E402
 
@@ -829,6 +834,42 @@ def _():
     assert (c.seed_threshold, c.mask_threshold) == (0.70, 0.35), c
     assert (c.min_area, c.min_seed_area, c.close_radius) == (400, 20, 2), c
     assert c.mask_threshold < c.seed_threshold, "hysteresis needs a looser extent than seed"
+
+
+@check("the submitted operating point is chosen by name, never by sort order")
+def _():
+    # Both halves of this have already gone wrong once.  Sort order picked
+    # fold0_tuned.json over oof_tuned.json and put a per-fold configuration into
+    # a real submission; and a glob for "*_tuned.json" alone cannot see
+    # ensemble_config.json at all, so attaching the calibration would have
+    # changed nothing while the run looked entirely normal.
+    everywhere = [
+        "/kaggle/input/f0/fold0_tuned.json",
+        "/kaggle/input/oof/oof_tuned.json",
+        "/kaggle/input/calib/ensemble_config.json",
+    ]
+    assert choose_config(everywhere).endswith("ensemble_config.json"), choose_config(everywhere)
+    assert choose_config(everywhere[:2]).endswith("oof_tuned.json")
+    # Order of arrival must not matter.
+    assert choose_config(list(reversed(everywhere))).endswith("ensemble_config.json")
+
+    # A lone per-fold config is still usable - that is a deliberate single-fold
+    # run, not an ambiguity.
+    assert choose_config(["/kaggle/input/f3/fold3_tuned.json"]).endswith("fold3_tuned.json")
+    assert choose_config([]) is None
+
+    # Several per-fold configs and no preferred name is genuinely ambiguous, and
+    # guessing there is exactly the bug.  Refuse.
+    try:
+        choose_config(["/kaggle/input/a/fold0_tuned.json", "/kaggle/input/b/fold1_tuned.json"])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("ambiguous configurations must refuse, not guess")
+
+    # The calibrated file's payload must survive the loader predict_test.py uses.
+    payload = {"config": PostprocessConfig(seed_threshold=0.9255).as_dict()}
+    assert PostprocessConfig(**payload.get("config", payload)).seed_threshold == 0.9255
 
 
 @check("submission validation catches unknown ids")

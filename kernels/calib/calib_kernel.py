@@ -14,6 +14,13 @@ import time
 CONFIG = {
     "IMAGES": 150,
     "TTA": 4,
+    # Measure both histograms on the *test* images.  On train images four of the
+    # five models have seen each one, so the ensemble map there is sharper than
+    # it will ever be at test time and the correction comes out too small - which
+    # is the leading explanation for why the stored shift (0.95 -> 0.9255) looked
+    # too small to account for a -0.047 CV-to-LB gap.  Reading test pixels uses
+    # no test labels and is not the MAGFiLO leak.
+    "ON": "test",
 }
 
 WORK = "/kaggle/working"
@@ -54,6 +61,7 @@ command = [
     "--config", oof[0],
     "--images", str(CONFIG["IMAGES"]),
     "--tta", str(CONFIG["TTA"]),
+    "--on", CONFIG["ON"],
     "--out", f"{WORK}/ensemble_config.json",
 ]
 
