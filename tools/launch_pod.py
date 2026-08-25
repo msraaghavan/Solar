@@ -47,7 +47,18 @@ REPO = "https://github.com/msraaghavan/Solar.git"
 # taken in fp16, where B4 overflowed and GradScaler dropped the offending steps
 # silently, so it cannot distinguish "B4 is worse" from "B4 was undertrained".
 DEFAULT_GPUS = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090", "NVIDIA A40"]
-DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1290-torch291-ubuntu2204"
+# cu1281, not cu1290.  A pod on a host whose driver is older than the image's
+# CUDA falls back to the container's forward-compatibility libraries, which fail
+# with "CUDA error 804: forward compatibility was attempted on non supported HW"
+# - torch imports, reports its CUDA version happily, and sees no device.  That
+# killed a smoke pod that had a perfectly healthy RTX 4090 in it.  A CUDA 12.8
+# build runs on any 12.8+ driver, so pairing this image with ALLOWED_CUDA below
+# makes the host pool as wide as it can safely be.
+DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2204"
+
+# Hosts whose driver is at least as new as the image's CUDA.  Without this,
+# RunPod is free to place the pod on an 12.6 host and the run dies at bootstrap.
+ALLOWED_CUDA = ["12.8", "12.9", "13.0"]
 
 
 def request(method: str, path: str, body: dict | None = None) -> object:
@@ -173,6 +184,7 @@ def launch(argv: argparse.Namespace, passthrough: list[str]) -> None:
         # Training was measured input-bound, not compute-bound, so the loader
         # decides throughput.  A fast card behind four workers idles.
         "minVCPUPerGPU": argv.vcpus,
+        "allowedCudaVersions": argv.cuda,
         "env": env,
         "dockerStartCmd": ["bash", "-lc", start_command(args_line, argv.hours)],
         "ports": ["22/tcp"],
@@ -231,6 +243,8 @@ def main() -> None:
     p.add_argument("--disk", type=int, default=60)
     p.add_argument("--vcpus", type=int, default=12)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--cuda", action="append", default=None,
+                   help="acceptable host CUDA versions; repeatable")
     p.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("list")
@@ -245,6 +259,7 @@ def main() -> None:
         if not argv.tag:
             argv.tag = time.strftime("%m%d%H%M", time.gmtime())
         argv.gpu = argv.gpu or DEFAULT_GPUS
+        argv.cuda = argv.cuda or ALLOWED_CUDA
         launch(argv, passthrough)
     elif argv.command == "list":
         pods_list()

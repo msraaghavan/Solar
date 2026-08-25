@@ -50,28 +50,60 @@ python -m pip install -q --upgrade pip
 TORCH_BEFORE=$(python -c "import torch; print(torch.__version__)")
 echo "pod torch: $TORCH_BEFORE  (this must not change)"
 
+# These images are bare: torch and torchaudio, but no numpy and no torchvision.
+# Both are needed - everything here is numpy-first, and timm imports torchvision
+# during create_model - and both have to arrive without letting pip move torch.
+#
+# Install only what is actually missing.  Reinstalling a package the image
+# already has is how you downgrade numpy underneath a torch that was compiled
+# against it, which fails at import with a C-level ABI error rather than
+# anything that mentions numpy.
+python -c "import numpy" 2>/dev/null || python -m pip install -q "numpy==2.0.2"
+
+if ! python -c "import torchvision" 2>/dev/null; then
+    # torchvision's minor version tracks torch's at a fixed offset of +15 for
+    # the 2.x line: torch 2.8/2.9/2.10/2.13 pair with torchvision
+    # 0.23/0.24/0.25/0.28.  Checked against two independent points - this
+    # machine's torch 2.13.0 with torchvision 0.28.0, and requirements.txt's
+    # torch 2.10.0 with torchvision 0.25.0.
+    #
+    # The build must also come from the same CUDA index as the installed torch,
+    # or the two disagree at the C++ ABI.  --no-deps so it cannot drag a
+    # different torch in behind it, which is exactly what timm did on pod one.
+    TV_SPEC=$(python -c "import torch;m=int(torch.__version__.split('+')[0].split('.')[1]);print('torchvision==0.%d.*' % (m + 15))")
+    TV_INDEX=$(python -c "import torch;v=torch.__version__;print('https://download.pytorch.org/whl/' + v.split('+')[1] if '+' in v else '')")
+    echo "installing $TV_SPEC from ${TV_INDEX:-pypi}"
+    if [ -n "$TV_INDEX" ]; then
+        python -m pip install -q --no-deps "$TV_SPEC" --index-url "$TV_INDEX" ||
+        python -m pip install -q --no-deps "$TV_SPEC"
+    else
+        python -m pip install -q --no-deps "$TV_SPEC"
+    fi
+fi
+
 python -m pip install -q --no-deps timm==1.0.26
-# timm's runtime dependencies other than torch/torchvision.  huggingface_hub and
-# safetensors are what fetch and load the pretrained encoder weights, so
-# --no-deps without these gets you a timm that fails at create_model(pretrained).
+# timm's remaining runtime dependencies.  huggingface_hub and safetensors are
+# what fetch and load the pretrained encoder weights, so --no-deps without these
+# gets a timm that fails at create_model(pretrained=True).
 python -m pip install -q pyyaml huggingface_hub safetensors
 python -m pip install -q opencv-python-headless==4.13.0.90 pycocotools==2.0.10
 
 # The Kaggle CLI is deliberately not in requirements.txt: that file documents the
-# runtime the submitted results were produced *on*, and the competition image
-# already provides it.  A rented pod provides nothing, and needs it twice - to
-# fetch the data below, and to publish results and checkpoints afterwards, which
-# is the only way anything survives an ephemeral pod.
+# runtime the submitted results were produced *on*, where it is already present.
+# A rented pod provides nothing, and needs it twice - to fetch the data below,
+# and to publish results and checkpoints afterwards, which is the only way
+# anything survives an ephemeral pod.
 python -m pip install -q kaggle
 
 TORCH_AFTER=$(python -c "import torch; print(torch.__version__)")
 if [ "$TORCH_BEFORE" != "$TORCH_AFTER" ]; then
     echo "!!! torch moved from $TORCH_BEFORE to $TORCH_AFTER while installing deps."
-    echo "!!! That is the exact failure the --no-deps above exists to prevent:"
+    echo "!!! That is the exact failure the --no-deps flags above exist to prevent:"
     echo "!!! a PyPI build compiled against a newer CUDA than this host's driver"
     echo "!!! imports cleanly and then sees no GPU at all."
     exit 1
 fi
+python -c "import numpy, torchvision, timm, cv2, pycocotools; print('imports ok: numpy', numpy.__version__, '| torchvision', torchvision.__version__, '| timm', timm.__version__)"
 echo "torch unchanged at $TORCH_AFTER"
 
 python - <<'PY'
