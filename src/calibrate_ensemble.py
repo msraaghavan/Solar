@@ -22,6 +22,24 @@ which is what averaging mostly is.
 The fraction is pooled over pixels from all sampled images rather than averaged
 over per-image thresholds, because the metric is micro-averaged too: an
 observation with many filaments should carry more weight than an empty one.
+
+Where to measure it (``--on``) changes the answer, and ``test`` is the better
+estimator of the two:
+
+``train``   Single-model maps come from the one model that held each image out,
+            so they are honest; the ensemble maps are not, because the other
+            four models trained on that image and are over-confident on it.
+            The ensemble histogram is therefore sharper than it will be at test
+            time and the correction comes out too small.
+
+``test``    Neither family has seen a test image, so both histograms are honest.
+            Measuring both on the *same* images matters for a second reason: the
+            transfer is only supposed to correct the single-to-ensemble shift,
+            and drawing the two histograms from different image populations
+            would fold in any difference in filament abundance between them -
+            correcting away a real difference in the sky rather than an artefact
+            of averaging.  Still label-free: it reads test *pixels*, never test
+            annotations.
 """
 
 from __future__ import annotations
@@ -93,6 +111,13 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="the out-of-fold tuned JSON")
     parser.add_argument("--images", type=int, default=150, help="observations to sample")
     parser.add_argument("--tta", type=int, default=4)
+    parser.add_argument(
+        "--on",
+        choices=("train", "test"),
+        default="train",
+        help="which images to measure the two histograms on; 'test' is the "
+             "better estimator (see the module docstring) and uses no labels",
+    )
     parser.add_argument("--out", default="artifacts/ensemble_config.json")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -104,55 +129,82 @@ def main() -> None:
     models = load_fold_models(args.checkpoints, args.device)
     print(f"{len(models)} models, folds {sorted(models)}", flush=True)
 
-    samples = load_samples(
-        os.path.join(args.data_root, "train", "MAGFiLO_1.0_Annotations_kaggle2026_train.json")
-    )
-    folds = make_folds(samples, n_folds=len(models))
-    contexts = load_contexts(args.context_cache)
-    train_dir = os.path.join(args.data_root, "train", "train_images")
+    if args.on == "test":
+        image_dir = os.path.join(args.data_root, "test", "test_images")
+        names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(image_dir, "*.jpeg")))
+        if not names:
+            raise SystemExit(f"no test images under {image_dir}")
+        contexts, folds = None, None
+    else:
+        samples = load_samples(
+            os.path.join(args.data_root, "train", "MAGFiLO_1.0_Annotations_kaggle2026_train.json")
+        )
+        folds = make_folds(samples, n_folds=len(models))
+        contexts = load_contexts(args.context_cache)
+        image_dir = os.path.join(args.data_root, "train", "train_images")
+        names = sorted({s.file_name for s in samples})
 
-    names = sorted({s.file_name for s in samples})
     if args.images and args.images < len(names):
         step = len(names) / args.images
         names = [names[int(i * step)] for i in range(args.images)]
+    print(f"measuring on {len(names)} {args.on} observations", flush=True)
 
     single = np.zeros(256, dtype=np.int64)
     ensemble = np.zeros(256, dtype=np.int64)
-    total = 0
+    single_total = 0
+    ensemble_total = 0
     t0 = time.time()
     for i, name in enumerate(names):
-        image = cv2.imread(os.path.join(train_dir, name), cv2.IMREAD_GRAYSCALE)
-        context = contexts[name]
+        image = cv2.imread(os.path.join(image_dir, name), cv2.IMREAD_GRAYSCALE)
+        # Test observations have no cached context; fit the geometry here, the
+        # same way predict_test.py does, so the two agree pixel for pixel.
+        context = contexts[name] if contexts else ImageContext.build(image, detect_disk(image))
         on_disk = disk_mask_for(context).astype(bool)
+        n_pixels = int(on_disk.sum())
 
-        held_out_by = folds[name]
         maps = {
             fold: predict_full(model, image, context, tta=args.tta, device=args.device)
             for fold, model in models.items()
         }
-        single += np.bincount(
-            np.round(maps[held_out_by][on_disk] * 255).astype(np.uint8), minlength=256
-        )
+
+        if args.on == "test":
+            # No model has seen a test image, so every one of the five is an
+            # honest draw from the single-model family; pool them all rather
+            # than picking one arbitrarily.
+            for probability in maps.values():
+                single += np.bincount(
+                    np.round(probability[on_disk] * 255).astype(np.uint8), minlength=256
+                )
+                single_total += n_pixels
+        else:
+            single += np.bincount(
+                np.round(maps[folds[name]][on_disk] * 255).astype(np.uint8), minlength=256
+            )
+            single_total += n_pixels
+
         averaged = np.mean(list(maps.values()), axis=0)
         ensemble += np.bincount(
             np.round(averaged[on_disk] * 255).astype(np.uint8), minlength=256
         )
-        total += int(on_disk.sum())
+        ensemble_total += n_pixels
         if (i + 1) % 25 == 0:
             print(f"  {i + 1}/{len(names)} ({time.time() - t0:.0f}s)", flush=True)
 
-    print(f"\nsampled {total / 1e9:.2f} G on-disk pixels from {len(names)} observations\n")
+    print(
+        f"\nsampled {ensemble_total / 1e9:.2f} G on-disk pixels from "
+        f"{len(names)} {args.on} observations\n"
+    )
 
     transferred = {}
     print(f"{'threshold':<18}{'fitted':>9}{'admits':>12}{'ensemble':>10}{'admits':>12}")
     for field in ("seed_threshold", "mask_threshold"):
         value = getattr(fitted, field)
-        fraction = quantile_of(single, total, value)
-        moved = threshold_for(ensemble, total, fraction)
+        fraction = quantile_of(single, single_total, value)
+        moved = threshold_for(ensemble, ensemble_total, fraction)
         transferred[field] = moved
         print(
             f"{field:<18}{value:>9.3f}{fraction:>12.3e}{moved:>10.3f}"
-            f"{quantile_of(ensemble, total, moved):>12.3e}"
+            f"{quantile_of(ensemble, ensemble_total, moved):>12.3e}"
         )
 
     # Areas are pixel counts, and the transfer holds admitted pixel mass fixed,
@@ -168,8 +220,9 @@ def main() -> None:
                 "config": adjusted.as_dict(),
                 "derived_from": os.path.basename(args.config),
                 "single_model_config": fitted.as_dict(),
+                "measured_on": args.on,
                 "observations_sampled": len(names),
-                "on_disk_pixels": total,
+                "on_disk_pixels": ensemble_total,
                 "method": "quantile transfer of admitted pixel mass, unsupervised",
             },
             fh,

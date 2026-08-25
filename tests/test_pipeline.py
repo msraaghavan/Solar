@@ -441,6 +441,42 @@ def _():
     assert moved < 0.6, "averaging shaves peaks; the threshold must fall"
 
 
+@check("the threshold transfer cancels abundance only when both halves share a population")
+def _():
+    from calibrate_ensemble import quantile_of, threshold_for
+
+    # The transfer is meant to correct one thing: the shift from single-model
+    # maps to averaged ones.  Drawing its two histograms from different image
+    # populations silently folds in a second thing - how many filaments each
+    # population actually contains - and "corrects" a real difference in the sky.
+    def population(rng, n, abundance, members=5):
+        filament = rng.random(n) < abundance
+        a = np.where(filament, 8.0, 1.0)
+        b = np.where(filament, 2.0, 30.0)
+        draws = np.stack([rng.beta(a, b) for _ in range(members)])
+        hist = lambda x: np.bincount(np.round(x * 255).astype(np.uint8), minlength=256)
+        return hist(draws[0]), hist(draws.mean(0)), n
+
+    rng = np.random.default_rng(0)
+    n = 1_500_000
+    single_a, ensemble_a, total_a = population(rng, n, 0.010)  # train-like
+    single_b, ensemble_b, total_b = population(rng, n, 0.030)  # test-like, 3x denser
+
+    for level in (0.95, 0.40):
+        fraction_a = quantile_of(single_a, total_a, level)
+        within_a = threshold_for(ensemble_a, total_a, fraction_a)
+        within_b = threshold_for(ensemble_b, total_b, quantile_of(single_b, total_b, level))
+        crossed = threshold_for(ensemble_b, total_b, fraction_a)
+
+        # Same family shift, so measuring inside either population agrees.
+        assert abs(within_a - within_b) < 0.02, (level, within_a, within_b)
+        # Mixing populations does not, and errs towards admitting too little.
+        assert crossed > within_b, (level, crossed, within_b)
+    assert crossed - within_b > 0.05, (
+        "the fixture must actually separate the two estimators"
+    )
+
+
 @check("connected components recover disjoint instances exactly")
 def _():
     p = np.zeros((128, 128), dtype=np.float32)
