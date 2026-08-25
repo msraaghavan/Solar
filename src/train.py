@@ -27,9 +27,18 @@ import torch
 from pycocotools import mask as mask_utils
 from torch.utils.data import DataLoader
 
-from data import ImageContext, Sample, build_contexts, load_samples, make_folds, save_contexts, load_contexts
+from data import (
+    ImageContext,
+    Sample,
+    build_contexts,
+    load_contexts,
+    load_samples,
+    make_folds,
+    save_contexts,
+    spine_alignment,
+)
 from dataset_torch import FilamentTiles
-from infer import disk_mask_for, predict_full
+from infer import AMP_CHOICES, amp_dtype_for, disk_mask_for, predict_full
 from losses import FilamentLoss
 from metrics import evaluate, evaluate_image, format_report
 from model import FilamentNet
@@ -75,6 +84,7 @@ def validate(
     device: str,
     tta: int = 1,
     max_files: int | None = None,
+    amp_dtype: str = "auto",
 ) -> dict:
     """Full-disk PQ over held-out observations, averaged across annotators."""
     by_file: dict[str, list[Sample]] = {}
@@ -101,7 +111,7 @@ def validate(
         image = cv2.imread(os.path.join(image_dir, file_name), cv2.IMREAD_GRAYSCALE)
         context = contexts[file_name]
         probability = predict_full(
-            model, image, context, tta=tta, device=device
+            model, image, context, tta=tta, device=device, amp_dtype=amp_dtype
         )
         on_disk = disk_mask_for(context)
         instances = extract_instances(probability, config, on_disk)
@@ -125,6 +135,42 @@ def validate(
     return report
 
 
+def spine_preflight(dataset, n: int = 40, min_alignment: float = 0.80) -> None:
+    """Assert the spine annotation has actually been understood.
+
+    Cheap - it touches no image, only the annotation geometry - and decisive.
+    Spine pixels are supposed to lie on their own filament (95.4% do, measured at
+    thickness 3), so alignment is a single number that fails loudly for every
+    silent way of getting this wrong: a spine wrapped one list deep that
+    rasterises to nothing at all, or ``(row, column)`` coordinates handed to
+    ``cv2.polylines``, which reads ``(x, y)`` and would draw every spine
+    reflected about the disk diagonal - landing it on quiet Sun while still
+    producing a perfectly plausible-looking target.
+    """
+    samples = [s for s in dataset.samples if s.instances]
+    if not samples:
+        raise RuntimeError("preflight: no annotated samples to check the spine against")
+    step = max(len(samples) // n, 1)
+    chosen = samples[::step][:n]
+
+    scores = [spine_alignment(s) for s in chosen]
+    empty = sum(1 for inside, _ in scores if inside == 0.0)
+    inside = float(np.mean([s[0] for s in scores]))
+    covered = float(np.mean([s[1] for s in scores]))
+    print(
+        f"  spine target: {inside:.1%} of spine pixels inside their filament, "
+        f"covering {covered:.1%} of its area ({empty}/{len(chosen)} readings empty)",
+        flush=True,
+    )
+    if inside < min_alignment:
+        raise RuntimeError(
+            f"preflight: only {inside:.1%} of spine pixels fall inside their own "
+            f"filament (expected ~95%).  The spine annotation is being misread - "
+            f"check the coordinate order and the nesting of the 'spine' field "
+            f"before spending GPU hours training against a wrong target."
+        )
+
+
 def preflight(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
@@ -134,6 +180,7 @@ def preflight(
     contexts: dict[str, ImageContext],
     device: str,
     epochs: int,
+    amp_dtype: str = "auto",
 ) -> None:
     """Exercise every path that can fail silently, before committing hours to a run.
 
@@ -147,12 +194,32 @@ def preflight(
     known up front rather than discovered three hours later.
     """
     print("--- preflight ---", flush=True)
-    amp = device.startswith("cuda")
+    dtype = amp_dtype_for(amp_dtype, device)
+    print(f"  autocast: {dtype if dtype is not None else 'disabled (fp32)'}", flush=True)
+
+    # 0. The auxiliary spine target, if it is switched on.  This path had never
+    # run against real annotations, and every way of misreading the field fails
+    # *silently* to an all-zero channel: the head then learns to predict nothing,
+    # the loss curve looks perfectly healthy, and hours of GPU time report that
+    # the spine "does not help" without ever having tested it.
+    if getattr(loader.dataset, "with_spine", False):
+        spine_preflight(loader.dataset)
 
     # 1. One real training step, in the same precision the run will use.
     t0 = time.time()
     features, target, weight = next(iter(loader))
     load_time = time.time() - t0
+
+    if getattr(loader.dataset, "with_spine", False):
+        if target.shape[1] != 2:
+            raise RuntimeError(
+                f"preflight: spine training wants a 2-channel target, got {target.shape[1]}"
+            )
+        if float(target[:, 1].sum()) <= 0.0:
+            raise RuntimeError(
+                "preflight: the spine channel is empty across a whole batch of "
+                "filament-centred tiles - the target is not reaching the loss"
+            )
     features, target, weight = (
         features.to(device), target.to(device), weight.to(device)
     )
@@ -166,7 +233,11 @@ def preflight(
     step_time = float("inf")
     for _ in range(3):
         t0 = time.time()
-        with torch.autocast(device_type=device.split(":")[0], enabled=amp):
+        with torch.autocast(
+            device_type=device.split(":")[0],
+            dtype=dtype or torch.float32,
+            enabled=dtype is not None,
+        ):
             loss = criterion(model(features), target, weight)
         loss.backward()
         if device.startswith("cuda"):
@@ -189,7 +260,9 @@ def preflight(
     file_name = sorted({s.file_name for s in val_samples})[0]
     image = cv2.imread(os.path.join(image_dir, file_name), cv2.IMREAD_GRAYSCALE)
     t0 = time.time()
-    probability = predict_full(model, image, contexts[file_name], tta=1, device=device)
+    probability = predict_full(
+        model, image, contexts[file_name], tta=1, device=device, amp_dtype=amp_dtype
+    )
     infer_time = time.time() - t0
     instances = extract_instances(
         probability, PostprocessConfig(), disk_mask_for(contexts[file_name])
@@ -247,6 +320,9 @@ def main() -> None:
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-steps", type=int, default=0, help="debug: cap steps/epoch")
+    parser.add_argument("--amp-dtype", choices=AMP_CHOICES, default="auto",
+                        help="autocast precision; 'auto' picks bf16 on Ampere and "
+                             "later, fp16 on older cards such as the Kaggle T4")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -328,10 +404,17 @@ def main() -> None:
         total_steps=args.epochs * steps_per_epoch,
         pct_start=0.1,
     )
-    scaler = torch.amp.GradScaler(enabled=args.device.startswith("cuda"))
+    # Loss scaling exists to keep fp16 gradients off the bottom of its range.
+    # bf16 has fp32's exponent range and needs none of it, and leaving the scaler
+    # on there would make the AMP-SKIPPED diagnostic below meaningless - it can
+    # only ever report zero, which reads as "no overflow" rather than "not
+    # applicable".
+    amp_dtype = amp_dtype_for(args.amp_dtype, args.device)
+    scaler = torch.amp.GradScaler(enabled=amp_dtype == torch.float16)
 
     preflight(
-        model, criterion, loader, val_samples, train_dir, contexts, args.device, args.epochs
+        model, criterion, loader, val_samples, train_dir, contexts, args.device,
+        args.epochs, args.amp_dtype,
     )
 
     best_pq = -1.0
@@ -351,7 +434,8 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type=args.device.split(":")[0],
-                enabled=args.device.startswith("cuda"),
+                dtype=amp_dtype or torch.float32,
+                enabled=amp_dtype is not None,
             ):
                 loss = criterion(model(features), target, weight)
             scaler.scale(loss).backward()
@@ -398,6 +482,7 @@ def main() -> None:
                 args.device,
                 tta=1,
                 max_files=args.val_files,
+                amp_dtype=args.amp_dtype,
             )
             message += (
                 f"  |  val PQ {report['pq_micro']:.4f} (SQ {report['sq']:.3f} "

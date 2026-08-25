@@ -77,10 +77,23 @@ semantic Dice 0.6517.
 | B0 + label smoothing 0.05 | 0.4281 | 0.6724 | 0.6368 |
 | EfficientNet-B4 | 0.4177 | 0.6711 | 0.6223 |
 
-**Label smoothing (-0.011) and B4 (-0.021) are both rejected.** B4 still triggers
-fp32 recomputation for non-finite fp16 logits and costs 378 s/epoch against B0's
-233 s. Beware: against fold 0's *old-code* 0.4065, label smoothing looked like a
-+0.022 gain. It is a loss. **Never compare across code versions.**
+**Label smoothing (-0.011) is rejected.** Beware: against fold 0's *old-code*
+0.4065, it looked like a +0.022 gain. It is a loss. **Never compare across code
+versions.**
+
+**B4 (-0.021) is NOT settled, and this is the most important open question.**
+That run triggered fp32 recomputation for non-finite fp16 logits, and GradScaler
+drops a step silently whenever gradients overflow — so B4 may simply have been
+undertrained rather than genuinely worse. The T4 is Turing and has only fp16, so
+on Kaggle the confound is unavoidable. **Any Ampere card (3090/4090) has bf16,
+which carries fp32's exponent range and cannot overflow that way.**
+
+As of commit 7471e57 the code no longer hardcodes torch's fp16 default:
+`--amp-dtype auto` resolves to bf16 on compute capability >= 8.0 and stays fp16
+on the T4, so existing results remain reproducible. **Re-testing capacity on
+Ampere with bf16 is the single highest-value experiment available**, because it
+is the only lever anyone has identified that could be worth more than +0.05, and
+the one measurement against it is confounded.
 
 ## The single most important correction to earlier reasoning
 
@@ -126,17 +139,25 @@ that has never been used:**
 `seed_threshold 0.95 -> 0.9255`, `mask_threshold 0.40 -> 0.392`, everything else
 unchanged (areas are pixel counts; the ratio moves with the transfer).
 
-**IMMEDIATE NEXT ACTION: re-run `filament-predict` with this config and submit
-(after asking the user).** Point the predict kernel at `filament-calib`, or pass
-`--config` explicitly. The predict kernel prefers `oof_tuned.json` by name, so
-this needs a deliberate change — do not let it pick by sort order; that was a
-real bug, see commit 9e5f4c0.
+**IMMEDIATE NEXT ACTION: re-run `filament-predict` with a calibrated config and
+submit (after asking the user).** Point the predict kernel at `filament-calib`,
+or pass `--config` explicitly. The predict kernel prefers `oof_tuned.json` by
+name, so this needs a deliberate change — do not let it pick by sort order; that
+was a real bug, see commit 9e5f4c0.
 
-Caveat to state honestly: the transfer quantiles were computed on *training*
-images, where 4 of 5 models have seen each image, so the ensemble maps there are
-sharper than on test. The correction may therefore be an underestimate. Consider
-recomputing the ensemble histogram on the 180 **test** images — that uses no
-labels at all and is strictly more correct.
+**Recompute the config with `--on test` first (commit a9e1d82).** The stored
+0.9255 was measured on *training* images, where 4 of 5 models have seen each
+image, so the ensemble maps there are sharper than they will ever be on test and
+the correction is a **lower bound**, not an estimate. `--on test` measures both
+histograms on the 180 test images, where no model has seen anything, and pools
+all five models for the single-model family instead of picking one. It reads
+test *pixels*, never test annotations, so it stays label-free.
+
+Measuring both halves on the *same* images is the point, not an incidental
+detail: on a synthetic population 3x denser in filaments, transferring within
+either population agrees to 0.004, while mixing them moves `mask_threshold` by
+0.19 — "correcting" a real difference in the sky as though it were an artefact
+of averaging. Asserted in `tests/test_pipeline.py`.
 
 The shift is smaller than expected (-0.025 on seed), so calibration probably does
 not explain the whole -0.047. Other candidates: test-set annotator composition
@@ -148,10 +169,26 @@ not explain the whole -0.047. Other candidates: test-set annotator composition
    supervision.** Host: *"You can use other meta data available in the dataset
    (i.e., spine, bbox, area, and category_id)."* The spine auxiliary head is
    **already built** (`--spine-weight`, `FilamentNet(out_channels=2)`, inference
-   already slices channel 0) and is **wired through the kernel but never tested**.
-   The hosts explicitly name "structural continuity / fragmented segmentations"
-   as a core challenge, and fragmentation is graded. This is the single most
-   promising untested idea.
+   already slices channel 0) and wired through the kernel. The hosts explicitly
+   name "structural continuity / fragmented segmentations" as a core challenge,
+   and fragmentation is graded. This is the single most promising untested idea.
+
+   **The path is now covered by six tests (commit c828ece), but it has still
+   never touched a real annotation** — no session has had the data and a GPU at
+   the same time. Two silent failure modes were found and closed by inspection:
+   a spine wrapped one list deep (the way `segmentation` is) tripped the
+   `len(spine) < 4` guard and rasterised to an **all-zero target**, which would
+   have trained the head on a blank image behind a healthy-looking loss curve;
+   and `cv2.polylines` reads `(x, y)`, so `(row, column)` data would draw every
+   spine reflected about the diagonal onto quiet Sun. `spine_points` now accepts
+   flat, wrapped and paired forms; `spine_alignment` measures the quantity that
+   catches the rest.
+
+   **`train.py` preflight now refuses to start** unless ≥80% of spine pixels
+   fall inside their own filament (published figure: 95.4%). It runs on
+   annotation geometry alone, costs no GPU time, and prints the alignment. **If
+   that line does not appear, or the run dies on it, the spine field is being
+   misread — fix the parse, do not lower the bar.**
 2. **Self-supervised pretraining on external unlabeled GONG H-alpha images is
    ALLOWED.** Host answered "Yes." A legitimate way to add data.
 
@@ -174,11 +211,38 @@ not explain the whole -0.047. Other candidates: test-set annotator composition
 - `tools/bootstrap_pod.sh` sets up a rented GPU pod.
 - Runtime confirmed matching `requirements.txt`: torch 2.10.0+cu128, timm 1.0.26,
   numpy 2.0.2, cv2 4.13.0, scipy 1.16.3, Tesla T4.
+- **A cloud Claude session cannot do any of the above.** It gets a fresh
+  container: no `data/`, no `artifacts/`, no `kernels/_runs/`, no Kaggle or
+  RunPod credentials, no GPU, and outbound HTTPS restricted enough that
+  kaggle.com, arxiv.org and the competition site are all blocked. It can install
+  deps from PyPI, run both test suites, and read and write code — nothing that
+  touches the data or the leaderboard. Anything needing data or a GPU has to run
+  from the user's own machine.
 
-## Tests — 38 checks, all passing
+## Rented GPU — read before spending
 
-`python tests/test_pipeline.py` (31) and `python tests/test_official_metric.py`
-(7). No pytest needed. Several encode real bugs:
+`tools/run_pod_experiment.sh` trains, evaluates, pushes results and **terminates
+the pod from a trap**, so it fires on success, on a failed job, on a crash and
+on Ctrl-C. `bootstrap_pod.sh` only prepares a pod and stops at a prompt; a
+finished pod bills exactly like a training one, so never leave that unattended.
+
+Two rules the runner enforces, both of which cost money to learn otherwise:
+
+1. **Always `--smoke` first.** One epoch, five steps, two validation files.
+   Costs cents, exercises spine preflight, a real step, full-disk inference,
+   instance extraction, the checkpoint round-trip and the result push.
+2. **Every spine run is paired with its own `spine-weight 0` baseline on the
+   same pod.** Fold 0's 0.4387 was measured under older code, on a T4, in fp16.
+   A pod is none of those three. Compare against the paired row, never 0.4387.
+
+**Checkpoints do not survive a pod** — they are ~50 MB and gitignored. For the
+five-fold ensemble, mount a network volume and point `ARTIFACT_DIR` at it, or
+the folds train, report their PQ and evaporate.
+
+## Tests — 47 checks, all passing
+
+`python tests/test_pipeline.py` (40) and `python tests/test_official_metric.py`
+(7). No pytest needed. Runs in ~4 s on CPU. Several encode real bugs:
 
 - the tuning grid must bracket every fitted value **and** every fitted value in
   every artefact (checks 73 values; `seed_threshold` was pinned at its ceiling in
@@ -189,28 +253,52 @@ not explain the whole -0.047. Other candidates: test-set annotator composition
 - fragmentation must use the host's any-overlap rule;
 - the ensemble threshold transfer must name the top of a distribution, not its
   floor (a step-function tail means whole ranges of thresholds admit the same
-  pixels).
+  pixels), and both its histograms must come from one image population;
+- the spine target must parse whatever nesting COCO used, must sit on its own
+  filament, and must reach the loss only when `--spine-weight` is set.
+
+Note that "every fitted value sits inside its grid" checks **0 values** unless
+`kernels/_runs/` is present — it walks the run artefacts, which are gitignored.
+It reports the count it checked; on the user's machine that is 73. A fresh clone
+will pass it vacuously.
 
 ## Bugs already found and fixed — do not reintroduce
 
 Earlier sessions: `persistent_workers=True` froze the dataset epoch (+0.052);
 fp16 NaN on B4 was silent because NaN comparisons are False; validation used
 `sorted()[:n]` so it only validated on 2011; `predict_full` assumed 1 output
-channel. This session: censored tuning grid; reading-level tune/report leak;
-fragmentation threshold mismatch; predict kernel choosing its config by
-alphabetical sort order.
+channel; censored tuning grid; reading-level tune/report leak; fragmentation
+threshold mismatch; predict kernel choosing its config by alphabetical sort
+order.
+
+25 Aug: `requirements.txt` pinned `opencv-python-headless==4.13.0`, which does
+not exist on PyPI — `cv2.__version__` reports `4.13.0` but the wheel is
+`4.13.0.90`, so the whole file failed to install. It is one of the two required
+repository deliverables, so this was the first thing a judge reproducing the
+pipeline would have hit. Also: the spine parse and coordinate-order traps above.
 
 ## Suggested priority order
 
-1. **Submit the calibrated config** (config already computed, needs one predict
-   run). Consider recomputing quantiles on test images first.
-2. **Test the spine auxiliary head** — sanctioned, built, untested, targets a
-   graded weakness. `--spine-weight 0.3` on fold 0, compare against 0.4387.
-3. **Attack the near-miss cliff** (+0.0359 available). We over-segment by 8%, so
+0. **`--smoke` on the first pod, before anything else.** Nothing in this repo
+   has ever run on a non-Kaggle GPU. Costs cents; proves the pipeline.
+1. **Re-test capacity on Ampere with bf16** (B4, and larger if it holds up).
+   The only identified lever that could be worth more than +0.05, and the one
+   measurement against it is confounded by fp16 overflow on a T4. Pair it with
+   a matched B0 baseline on the same pod.
+2. **Submit a calibrated config.** Recompute it first with
+   `src/calibrate_ensemble.py --on test` (the stored 0.9255 is a lower bound,
+   see above), then one predict run. Both are GPU-only.
+3. **Test the spine auxiliary head** — sanctioned, built, covered by tests, and
+   verified end to end on synthetic data (spine alignment 93.4%, gradient
+   reaches head channel 1, checkpoint round-trips, inference reads channel 0)
+   but still never run against real annotations. `--spine-weight 0.3` on fold 0,
+   against its paired baseline. Watch the preflight alignment line.
+4. **Attack the near-miss cliff** (+0.0359 available). We over-segment by 8%, so
    the lever is boundary *shape*, not size. Consider a boundary-aware loss.
-4. **Re-run the pooled OOF fit** once a better model exists; worth +0.02-0.03
-   over per-fold configs, and the grid may still be censored.
-5. **Fix the 10 empty observations** with a relax-until-non-empty fallback.
+5. **Re-run the pooled OOF fit** once a better model exists; worth +0.02-0.03
+   over per-fold configs, and the grid may still be censored. This now also
+   fits `fallback_min_area` (the empty-observation rescue, commit 4e801b9),
+   which is on the grid at 0 and has never been fitted.
 6. **Write the 4-page report.** Required figures: a pipeline diagram and example
    segmentations. Required content: train/val/test split strategy, error bars (we
    have per-fold sd and measured selection optimism), and

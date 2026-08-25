@@ -48,7 +48,7 @@ import numpy as np
 import torch
 
 from data import load_contexts, load_samples, make_folds, stride_split
-from infer import disk_mask_for, predict_full
+from infer import AMP_CHOICES, disk_mask_for, predict_full
 from metrics import format_report
 from model import FilamentNet
 from postprocess import (
@@ -123,6 +123,8 @@ def main() -> None:
     )
     parser.add_argument("--out", default="artifacts/oof_tuned.json")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--amp-dtype", choices=AMP_CHOICES, default="auto",
+                        help="autocast precision; \'auto\' picks bf16 on Ampere and later")
     args = parser.parse_args()
 
     train_dir = os.path.join(args.data_root, "train", "train_images")
@@ -165,7 +167,8 @@ def main() -> None:
 
         held_out_by = folds[file_name]
         probability = predict_full(
-            models[held_out_by], image, context, tta=args.tta, device=args.device
+            models[held_out_by], image, context, tta=args.tta, device=args.device,
+            amp_dtype=args.amp_dtype,
         )
         maps[file_name] = quantise(probability, disk)
 
@@ -175,7 +178,8 @@ def main() -> None:
                 if fold == held_out_by:
                     continue
                 total += predict_full(
-                    model, image, context, tta=args.tta, device=args.device
+                    model, image, context, tta=args.tta, device=args.device,
+                    amp_dtype=args.amp_dtype,
                 )
             ensemble_maps[file_name] = quantise(total / len(models), disk)
 

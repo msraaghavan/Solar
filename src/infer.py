@@ -23,6 +23,48 @@ from data import ImageContext
 
 IMAGE_SIZE = 2048
 
+AMP_CHOICES = ("auto", "bf16", "fp16", "fp32")
+
+
+def choose_amp_dtype(
+    preference: str, device: str, capability: tuple[int, int] | None
+) -> "torch.dtype | None":
+    """Pick the autocast dtype; ``None`` means run in full precision.
+
+    Every autocast site here used to take torch's default, which on CUDA is
+    fp16.  That is the right choice on the Kaggle T4 and the wrong one on
+    anything newer, and the difference is not cosmetic: EfficientNet-B4
+    overflowed fp16 on the T4, and the resulting non-finite gradients were
+    *silently* dropped by GradScaler.  A B4 run can therefore be badly
+    undertrained while its loss curve looks healthy - which is exactly the
+    caveat recorded against the measured B4 result.
+
+    bf16 carries fp32's exponent range, so that failure mode does not exist on
+    hardware that supports it natively.  ``auto`` selects it from compute
+    capability >= 8.0 (Ampere and later) rather than from
+    ``torch.cuda.is_bf16_supported()``, which reports True for emulated bf16 on
+    older cards and would quietly select a slow path on the very T4 the current
+    results were measured on.
+    """
+    if preference not in AMP_CHOICES:
+        raise ValueError(f"amp dtype must be one of {AMP_CHOICES}, got {preference!r}")
+    if preference == "fp32" or not device.startswith("cuda"):
+        return None
+    if preference == "bf16":
+        return torch.bfloat16
+    if preference == "fp16":
+        return torch.float16
+    native_bf16 = capability is not None and capability[0] >= 8
+    return torch.bfloat16 if native_bf16 else torch.float16
+
+
+def amp_dtype_for(preference: str, device: str) -> "torch.dtype | None":
+    """:func:`choose_amp_dtype` against the live device."""
+    capability = (
+        torch.cuda.get_device_capability() if device.startswith("cuda") else None
+    )
+    return choose_amp_dtype(preference, device, capability)
+
 
 def _cosine_window(size: int) -> np.ndarray:
     """Separable raised-cosine, floored so tile centres keep full weight."""
@@ -56,12 +98,17 @@ def predict_full(
     batch_size: int = 8,
     device: str = "cuda",
     amp: bool = True,
+    amp_dtype: str = "auto",
 ) -> np.ndarray:
     """Probability map for one full 2048x2048 observation.
 
     ``tta`` selects how many of the eight symmetries to average (1 disables it,
     4 uses the rotations, 8 uses rotations and reflections).
+
+    ``amp_dtype`` follows :func:`choose_amp_dtype`; ``amp=False`` overrides it
+    and runs in full precision.
     """
+    dtype = amp_dtype_for(amp_dtype, device) if amp else None
     model.eval()
     accumulator = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
     weights = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
@@ -82,7 +129,11 @@ def predict_full(
         )
         for k in range(tta):
             view = _dihedral(batch, k)
-            with torch.autocast(device_type=device.split(":")[0], enabled=amp):
+            with torch.autocast(
+                device_type=device.split(":")[0],
+                dtype=dtype or torch.float32,
+                enabled=dtype is not None,
+            ):
                 logits = model(view)
             # A model trained with the auxiliary spine head emits two channels;
             # only channel 0 is the filament mask.  Slicing here rather than
@@ -95,7 +146,9 @@ def predict_full(
             # is silently *lost* downstream rather than raised - every comparison
             # against it is False, so the pixel drops out as background and the
             # mask is quietly corrupted.  Recompute the offending batch in full
-            # precision instead of letting that through.
+            # precision instead of letting that through.  The guard stays under
+            # bf16, which has fp32's range and should never reach it: if it ever
+            # fires there the cause is not overflow and is worth knowing about.
             if not torch.isfinite(logits).all():
                 nonfinite_batches[0] += 1
                 with torch.autocast(device_type=device.split(":")[0], enabled=False):

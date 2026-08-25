@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from data import ImageContext, load_contexts
-from infer import disk_mask_for, predict_full
+from infer import AMP_CHOICES, disk_mask_for, predict_full
 from model import FilamentNet
 from postprocess import PostprocessConfig, extract_instances
 from preprocess import Disk, detect_disk
@@ -56,6 +56,8 @@ def main() -> None:
     parser.add_argument("--tta", type=int, default=4)
     parser.add_argument("--out", default="submission.csv")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--amp-dtype", choices=AMP_CHOICES, default="auto",
+                        help="autocast precision; 'auto' picks bf16 on Ampere and later")
     args = parser.parse_args()
 
     test_dir = os.path.join(args.data_root, "test", "test_images")
@@ -91,7 +93,8 @@ def main() -> None:
         probability = np.zeros((2048, 2048), dtype=np.float32)
         for model in models:
             probability += predict_full(
-                model, image, context, tta=args.tta, device=args.device
+                model, image, context, tta=args.tta, device=args.device,
+                amp_dtype=args.amp_dtype
             )
         probability /= len(models)
 

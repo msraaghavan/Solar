@@ -99,6 +99,35 @@ def load_samples(annotation_path: str) -> list[Sample]:
     return samples
 
 
+def spine_points(spine: Sequence[float] | Sequence[Sequence[float]]) -> np.ndarray:
+    """Normalise one annotation's spine to an ``(N, 2)`` array of ``(x, y)`` points.
+
+    COCO does not fix a convention for a polyline field, and the same polyline
+    can arrive in three shapes: flat as ``[x0, y0, x1, y1, ...]``, wrapped once
+    as ``[[x0, y0, x1, y1, ...]]`` the way ``segmentation`` is, or already paired
+    as ``[[x0, y0], [x1, y1], ...]``.  Guessing wrong is *silent*: a wrapped
+    spine has outer length 1, trips any ``len(spine) < 4`` guard, and rasterises
+    to an all-zero target - so the auxiliary head trains on a blank image, the
+    run looks healthy, and the experiment reports "spine does not help" having
+    never tested it.  Accept all three instead, and reject anything else loudly.
+    """
+    if spine is None or len(spine) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    first = spine[0]
+    if isinstance(first, (list, tuple, np.ndarray)):
+        parts = [np.asarray(p, dtype=np.float32).reshape(-1) for p in spine]
+        # Pairs [[x0, y0], [x1, y1], ...] concatenate to the same flat vector as
+        # a single wrapped run [[x0, y0, x1, y1, ...]], so both fall out here.
+        flat = np.concatenate(parts) if parts else np.empty(0, dtype=np.float32)
+    else:
+        flat = np.asarray(spine, dtype=np.float32).reshape(-1)
+
+    if flat.size % 2:
+        raise ValueError(f"spine has an odd number of coordinates: {flat.size}")
+    return flat.reshape(-1, 2)
+
+
 def rasterise_spines(
     spines: Sequence[Sequence[float]], thickness: int = 3, size: int = IMAGE_SIZE
 ) -> np.ndarray:
@@ -117,12 +146,21 @@ def rasterise_spines(
     so the target is a genuine central core.  (At thickness 1 alignment is 99.3%,
     confirming the annotations agree; at 9 the "spine" is as large as the
     filament itself and stops being an axis.)
+
+    The full frame is drawn and cropped, rather than rasterised per tile in a
+    shifted frame, on measurement: the whole-frame draw costs 0.30 ms against
+    7.4 ms for ``tile_planes`` and tens of milliseconds for the JPEG decode
+    beside it, so tile-local drawing would buy ~0.2% of the data pipeline.  It
+    would also cost correctness - ``cv2.polylines`` clips to integer canvas
+    bounds, so a spine entering the tile from outside rasterises on a different
+    Bresenham phase and lands up to a pixel off (measured: IoU 0.89 against the
+    cropped full-frame draw, worst case 0.69).
     """
     canvas = np.zeros((size, size), dtype=np.uint8)
     for spine in spines:
-        if not spine or len(spine) < 4:
+        points = spine_points(spine)
+        if len(points) < 2:
             continue
-        points = np.asarray(spine, dtype=np.float32).reshape(-1, 2)
         cv2.polylines(
             canvas,
             [np.round(points).astype(np.int32)],
@@ -132,6 +170,31 @@ def rasterise_spines(
             lineType=cv2.LINE_8,
         )
     return canvas
+
+
+def spine_alignment(sample: "Sample", thickness: int = 3) -> tuple[float, float]:
+    """``(spine pixels inside the mask, mask pixels covered)`` for one reading.
+
+    The single measurement that decides whether the spine annotation has been
+    understood at all.  Every way of misreading the field - a wrapped list that
+    rasterises to nothing, or ``(row, column)`` order fed to ``cv2.polylines``,
+    which expects ``(x, y)`` and would draw every spine transposed about the
+    disk centre - lands the spine somewhere other than on its own filament.  The
+    published alignment at thickness 3 is 95.4%, so anything near zero means the
+    target is wrong, not merely noisy.
+    """
+    if not sample.instances:
+        return (0.0, 0.0)
+    mask = mask_utils.decode(sample.semantic_rle).astype(bool)
+    # Size follows the mask rather than IMAGE_SIZE so the check works on the
+    # small fixtures the tests use as well as on real 2048px readings.
+    spine = rasterise_spines(
+        sample.spines, thickness=thickness, size=mask.shape[0]
+    ).astype(bool)
+    if not spine.any():
+        return (0.0, 0.0)
+    inside = float((spine & mask).sum())
+    return (inside / float(spine.sum()), inside / max(float(mask.sum()), 1.0))
 
 
 def make_folds(

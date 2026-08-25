@@ -88,6 +88,22 @@ class PostprocessConfig:
     open_radius: int = 0
     dilate_radius: int = 0
     fill_holes: bool = True
+    # Minimum area for the single candidate emitted when the operating point
+    # admits nothing at all; 0 disables the fallback.
+    #
+    # 10 of 707 observations (1.4%) currently emit nothing, and every one is a
+    # pure loss: no training reading contains zero filaments (minimum 1, mean
+    # 7.1), so an empty prediction set is certainly wrong.  It scores 0 on the
+    # numerator while still charging 0.5 per missed segment, and unlike every
+    # other error it cannot be partly right.
+    #
+    # It does not follow that emitting something is free.  The marginal rule in
+    # the module docstring applies here as everywhere: the candidate pays only
+    # if its hit probability clears ~0.5*PQ/SQ, about 0.31 at current levels, and
+    # a blob the fitted point rejected is by construction a weak one.  So this is
+    # an axis for the tuner to settle, defaulting to off, and not a correction
+    # applied on the strength of the argument alone.
+    fallback_min_area: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -132,6 +148,11 @@ TUNING_GRIDS: dict[str, Iterable] = {
     "close_radius": (0, 2, 4, 6, 8, 10),
     "dilate_radius": (0, 1, 2, 3, 5),
     "open_radius": (0, 1, 2),
+    # Only ~1.4% of observations can reach this axis at all, so its effect on
+    # pooled PQ is bounded at roughly +0.005 even if every rescued candidate
+    # hits.  It is on the grid so the tuner can take that if it is there, and
+    # reject it - staying at 0 - if the rescued blobs are mostly false positives.
+    "fallback_min_area": (0, 50, 100, 200, 400, 800, 1600),
 }
 
 
@@ -158,7 +179,71 @@ def extract_instances(
     uint8, which is the difference between fitting on the machine and not.  The
     quantisation step is 1/255, roughly an order of magnitude finer than the
     smallest gap in the threshold grids, so it cannot change which value wins.
+
+    When the configuration admits nothing and ``fallback_min_area`` is set, one
+    last candidate is emitted rather than an empty set - see
+    :func:`_rescue_empty`.
     """
+    instances = _extract(probability, config, disk_mask)
+    if instances or config.fallback_min_area <= 0:
+        return instances
+    return _rescue_empty(probability, config, disk_mask)
+
+
+def _rescue_empty(
+    probability: np.ndarray,
+    config: PostprocessConfig,
+    disk_mask: np.ndarray | None,
+) -> list[dict]:
+    """Emit the single most confident component when nothing cleared the bar.
+
+    The seed level is dropped to the map's own on-disk peak, so whatever the
+    model was most sure about is guaranteed to seed exactly one component; the
+    *extent* still comes from the fitted ``mask_threshold``, so this relaxes
+    which blob is admitted without also inflating how far it reaches.
+
+    Taking the peak rather than a fixed lower threshold is what keeps the
+    fallback self-limiting.  If the peak sits below ``mask_threshold`` there are
+    no pixels above the extent level either, and the rescue correctly returns
+    nothing rather than flooding the disk - which is what a fixed relaxation
+    would do on a map the model left blank.
+
+    Exactly one component is returned, never several.  Each additional candidate
+    has to clear the marginal-emission bar on its own, and after the most
+    confident one they are strictly weaker; emitting the rest would trade a
+    small chance of a second hit for a near-certain string of false positives.
+    """
+    scale = 255.0 if probability.dtype == np.uint8 else 1.0
+    on_disk = probability if disk_mask is None else probability[disk_mask.astype(bool)]
+    if on_disk.size == 0:
+        return []
+    peak = float(on_disk.max()) / scale
+    if peak <= 0.0:
+        return []
+
+    relaxed = replace(
+        config,
+        seed_threshold=max(peak, config.mask_threshold),
+        min_area=config.fallback_min_area,
+        # One peak-level pixel is enough to seed, but at least one is required:
+        # with no seed requirement at all every blob above mask_threshold would
+        # qualify, which is the opposite of emitting the most confident one.
+        min_seed_area=1,
+        min_seed_fraction=0.0,
+        fallback_min_area=0,
+    )
+    candidates = _extract(probability, relaxed, disk_mask)
+    if len(candidates) <= 1:
+        return candidates
+    return [max(candidates, key=mask_utils.area)]
+
+
+def _extract(
+    probability: np.ndarray,
+    config: PostprocessConfig,
+    disk_mask: np.ndarray | None = None,
+) -> list[dict]:
+    """One extraction pass at exactly the configuration given."""
     scale = 255.0 if probability.dtype == np.uint8 else 1.0
     mask_level = min(config.mask_threshold, config.seed_threshold) * scale
     binary = (probability >= mask_level).astype(np.uint8)
