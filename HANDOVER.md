@@ -264,8 +264,15 @@ billing; `kill all` stops everything.
 Pricing checked 25 Aug 2026 on Community: **RTX 4090 $0.34/h, High stock**;
 3090 $0.22/h Medium; A40 $0.35/h High. All three are Ampere-or-later and have
 native bf16, which is the entire reason to rent rather than use the Kaggle T4.
-$20 is roughly **58 GPU-hours** at 4090 prices, so the binding constraint on
-these experiments is wall-clock and attention, not money.
+$20 is roughly **58 GPU-hours** at 4090 prices.
+
+**Spend it only on what Kaggle physically cannot do.** Kaggle's free quota is 30
+h/week, and 15 Nov is ~12 weeks out: that is ~360 T4-hours, which dwarfs the
+rented budget. The one thing a T4 cannot do is bf16 — it is Turing, fp16 only —
+so the rented cards exist for the *capacity* question and nothing else. Five-fold
+retrains, pooled OOF fits, calibration and prediction all belong on Kaggle, free.
+Note the weekly quota resets: the 25.7 h recorded earlier was from the week of
+14 Aug and does not still apply.
 
 ## Tests — 48 checks, all passing
 
