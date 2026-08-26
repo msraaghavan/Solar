@@ -42,11 +42,29 @@ import urllib.request
 API = "https://rest.runpod.io/v1"
 REPO = "https://github.com/msraaghavan/Solar.git"
 
-# Ada (8.9) and Ampere (8.6) both have native bf16, which is the entire point of
-# renting rather than using the Kaggle T4: the one B4 measurement on record was
-# taken in fp16, where B4 overflowed and GradScaler dropped the offending steps
-# silently, so it cannot distinguish "B4 is worse" from "B4 was undertrained".
-DEFAULT_GPUS = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090", "NVIDIA A40"]
+# Anything Ampere (8.6) or later has native bf16; Turing and Volta do not, which
+# rules out the T4 and the V100 and is the entire point of renting: the one B4
+# measurement on record was taken in fp16 on a T4, where B4 overflowed and
+# GradScaler dropped the offending steps silently, so it cannot distinguish
+# "B4 is worse" from "B4 was undertrained".
+#
+# A wide list is what keeps a pod schedulable - "no instances currently
+# available" is a real and frequent answer to a narrow request on Community, and
+# training is input-bound anyway, so the card is rarely the bottleneck.
+DEFAULT_GPUS = [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA RTX A6000",
+    "NVIDIA A40",
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA RTX A5000",
+    "NVIDIA GeForce RTX 4080 SUPER",
+    "NVIDIA RTX A4500",
+    "NVIDIA RTX PRO 4500 Blackwell",
+    "NVIDIA GeForce RTX 3090 Ti",
+    "NVIDIA RTX 4000 Ada Generation",
+    "NVIDIA RTX A4000",
+    "NVIDIA L40S",
+]
 # cu1281, not cu1290.  A pod on a host whose driver is older than the image's
 # CUDA falls back to the container's forward-compatibility libraries, which fail
 # with "CUDA error 804: forward compatibility was attempted on non supported HW"
@@ -121,8 +139,12 @@ def start_command(args_line: str, hours: int) -> str:
             '"licenses":[{"name":"CC0-1.0"}]}\' '
             '"$RUN_TAG" "$KAGGLE_USERNAME" "$RUN_TAG" > $d/dataset-metadata.json',
             "  python -m pip install -q kaggle >/dev/null 2>&1",
-            "  python -m kaggle datasets create -p $d -q ||"
-            ' python -m kaggle datasets version -p $d -m "console" -q',
+            "  # `create` prints its refusal and exits 0, so `create || version`",
+            "  # never falls through - the same trap that cost a finished pod its",
+            "  # results.  Decide on the message.",
+            "  o=$(python -m kaggle datasets create -p $d -q 2>&1)",
+            "  case \"$o\" in *'already in use'*|*'already exists'*)",
+            "    python -m kaggle datasets version -p $d -m console -q ;; esac",
             "}",
             "",
             "terminate() {",
@@ -241,7 +263,7 @@ def main() -> None:
     p.add_argument("--image", default=DEFAULT_IMAGE)
     p.add_argument("--hours", type=int, default=6, help="wall-clock kill switch")
     p.add_argument("--disk", type=int, default=60)
-    p.add_argument("--vcpus", type=int, default=12)
+    p.add_argument("--vcpus", type=int, default=8)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--cuda", action="append", default=None,
                    help="acceptable host CUDA versions; repeatable")
