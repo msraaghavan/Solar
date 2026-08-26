@@ -74,19 +74,16 @@ DEFAULT_GPUS = [
 # makes the host pool as wide as it can safely be.
 DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2204"
 
-# Hosts this cu128 image actually runs on, established by failure rather than by
-# reasoning about compatibility.  A driver *older* than the image's CUDA fails
-# with error 804 ("forward compatibility ... on non supported HW"), which is the
-# expected direction.  But CUDA **13.0** hosts fail too, in the other direction:
-# torch initialises to "CUDA unknown error" and sees no device on an RTX 4090
-# that nvidia-smi describes perfectly.  Observed three times on three separate
-# 580.x hosts, while every 570.x host worked.  Backward compatibility says this
-# should be fine; it is not, so the list is empirical.
-#
-# If a future image is built against CUDA 13, add "13.0" back and drop the older
-# entries - the rule is that the host driver and the image should agree, not
-# merely be ordered.
-ALLOWED_CUDA = ["12.8", "12.9"]
+# Hosts this cu128 image runs on.  A driver *older* than the image's CUDA fails
+# with error 804 ("forward compatibility ... on non supported HW"), so 12.8 is
+# the floor.  CUDA 13.0 hosts failed too, in the other direction - "CUDA unknown
+# error" on an RTX 4090 nvidia-smi described perfectly, three times on three
+# separate 580.x hosts - but that has a cause and a fix, applied in the start
+# command: the container's own forward-compat libraries shadow the newer host
+# driver.  13.0 is back on the list because excluding it roughly halved the
+# schedulable pool, and "no instances currently available" is the failure that
+# actually blocks work.
+ALLOWED_CUDA = ["12.8", "12.9", "13.0"]
 
 
 def request(method: str, path: str, body: dict | None = None) -> object:
@@ -179,16 +176,31 @@ def start_command(args_line: str, hours: int) -> str:
             "",
             "# Prove the GPU is usable before paying for anything else.  A",
             "# Community host can present a perfectly healthy card to nvidia-smi",
-            "# while torch gets 'CUDA unknown error' and sees no device - two pods",
-            "# that landed on the same machine both failed exactly that way.",
-            "# Without this check the failure surfaces only after pip installs and",
-            "# a 751 MB download, so a dead host costs minutes instead of seconds",
-            "# and the retry is correspondingly slower.",
-            "python -c \"import torch;"
+            "# while torch gets 'CUDA unknown error' and sees no device.  Without",
+            "# this check that surfaces only after pip installs and a 751 MB",
+            "# download, so a dead host costs minutes instead of seconds.",
+            "gpu_ok() {",
+            "  python -c \"import torch;"
             "assert torch.cuda.is_available(), 'torch sees no CUDA device';"
             "torch.randn(64,64,device='cuda').sum().item();"
-            "print('GPU OK:', torch.cuda.get_device_name(0))\""
-            " || { echo 'HOST GPU UNUSABLE - abandoning this pod'; exit 1; }",
+            "print('GPU OK:', torch.cuda.get_device_name(0))\"",
+            "}",
+            "",
+            "if ! gpu_ok; then",
+            "  # /usr/local/cuda/compat holds forward-compatibility libraries, whose",
+            "  # job is to let an OLD driver run a NEWER toolkit.  On a host whose",
+            "  # driver is NEWER than the image - every CUDA 13.0 host we landed on -",
+            "  # they instead shadow a perfectly good driver, and torch reports",
+            "  # 'CUDA unknown error' on a card nvidia-smi describes correctly.",
+            "  # Removing them lets torch use the host driver, which is backward",
+            "  # compatible with this image's cu128 binaries.",
+            "  echo 'retrying without the container CUDA forward-compat libraries'",
+            "  export LD_LIBRARY_PATH=$(python -c \"import os;"
+            "print(':'.join(p for p in os.environ.get('LD_LIBRARY_PATH','').split(':')"
+            " if 'compat' not in p))\")",
+            "  mv /usr/local/cuda/compat /usr/local/cuda/compat.disabled 2>/dev/null",
+            "  gpu_ok || { echo 'HOST GPU UNUSABLE - abandoning this pod'; exit 1; }",
+            "fi",
             "command -v git >/dev/null ||"
             " (apt-get update -qq && apt-get install -y -qq git curl unzip)",
             "cd /workspace || exit 1",
