@@ -42,6 +42,7 @@ KEEP_ALIVE=${KEEP_ALIVE:-0}       # 1 = do not terminate (debugging only)
 
 SPINE_WEIGHTS=()
 ENCODERS=()
+BOUNDARIES=()
 FOLD=${FOLD:-0}
 EPOCHS=${EPOCHS:-30}
 # Two pods running the same configuration at different seeds is how run-to-run
@@ -60,6 +61,7 @@ while [ $# -gt 0 ]; do
         --fold)   FOLD="$2";   shift 2 ;;
         --epochs) EPOCHS="$2"; shift 2 ;;
         --encoder) ENCODERS+=("$2"); shift 2 ;;
+        --boundary) BOUNDARIES+=("$2"); shift 2 ;;
         --no-baseline) BASELINE=0; shift ;;
         --smoke)  SMOKE=1; shift ;;
         --keep-alive) KEEP_ALIVE=1; shift ;;
@@ -68,6 +70,9 @@ while [ $# -gt 0 ]; do
 done
 [ ${#SPINE_WEIGHTS[@]} -eq 0 ] && SPINE_WEIGHTS=(0.3)
 [ ${#ENCODERS[@]} -eq 0 ] && ENCODERS=(tf_efficientnet_b0)
+# Falls back to the pod-level BOUNDARY (default 0), so existing invocations and
+# every result measured before this axis existed are unaffected.
+[ ${#BOUNDARIES[@]} -eq 0 ] && BOUNDARIES=("$BOUNDARY")
 
 # --smoke: one epoch, five steps, two validation files.  Costs a few cents and
 # exercises every path that can fail after an hour of billing - the spine
@@ -108,10 +113,20 @@ fi
 # version - so the difference between their PQs is the encoder and nothing else.
 # The single existing B4 number cannot be used for this: it was measured on a T4
 # in fp16, where B4 overflowed and GradScaler dropped steps silently.
+#
+# The boundary axis works the same way, and is the one to pair when testing mask
+# quality:
+#
+#   --boundary 0 --boundary 3 --spine 0 --no-baseline
+#
+# runs the boundary term against its own baseline on one card at one seed, which
+# is the only way the difference means anything.
 JOBS=()
 for enc in "${ENCODERS[@]}"; do
     for w in "${SPINE_WEIGHTS[@]}"; do
-        JOBS+=("$enc|$w")
+        for b in "${BOUNDARIES[@]}"; do
+            JOBS+=("$enc|$w|$b")
+        done
     done
 done
 echo "queue (${#JOBS[@]} jobs): ${JOBS[*]}"
@@ -312,12 +327,14 @@ publish_to_kaggle light || true
 
 for job in "${JOBS[@]}"; do
     ENCODER="${job%%|*}"
-    weight="${job##*|}"
+    rest="${job#*|}"
+    weight="${rest%%|*}"
+    BOUNDARY="${rest##*|}"
     # Tags every artefact for this job.  It has to carry the encoder as well as
     # the weight, or a two-encoder queue silently overwrites its own results.
     tag="${ENCODER#tf_efficientnet_}_spine${weight}_bnd${BOUNDARY}_seed${SEED}"
     echo ""
-    echo "=== fold $FOLD, encoder $ENCODER, spine-weight $weight ==="
+    echo "=== fold $FOLD, encoder $ENCODER, spine-weight $weight, boundary-weight $BOUNDARY ==="
     default_val=(--val-every 3 --val-files 40)
     [ "$SMOKE" = "1" ] && default_val=()
     python src/train.py \
