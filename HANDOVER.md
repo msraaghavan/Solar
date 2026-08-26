@@ -393,9 +393,9 @@ retrains, pooled OOF fits, calibration and prediction all belong on Kaggle, free
 Note the weekly quota resets: the 25.7 h recorded earlier was from the week of
 14 Aug and does not still apply.
 
-## Tests — 49 checks, all passing
+## Tests — 50 checks, all passing
 
-`python tests/test_pipeline.py` (42) and `python tests/test_official_metric.py`
+`python tests/test_pipeline.py` (43) and `python tests/test_official_metric.py`
 (7). No pytest needed. Runs in ~4 s on CPU. Several encode real bugs:
 
 - the tuning grid must bracket every fitted value **and** every fitted value in

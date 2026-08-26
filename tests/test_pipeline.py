@@ -873,6 +873,54 @@ def _():
     print(f"      ({inside:.1%} alignment over {len(chosen)} readings)", end="")
 
 
+@check("the boundary term is exactly inert at weight 0, and proper at any weight")
+def _():
+    import torch
+    from losses import FilamentLoss, boundary_band
+
+    torch.manual_seed(0)
+    logits = torch.randn(2, 1, 64, 64)
+    target = torch.zeros(2, 1, 64, 64)
+    target[:, :, 20:40, 26:36] = 1.0
+    weight = torch.ones(2, 1, 64, 64)
+
+    # The whole point of defaulting to 0: every result measured before this term
+    # existed has to stay comparable.  Not "close" - identical.
+    base = float(FilamentLoss()(logits, target, weight))
+    off = float(FilamentLoss(boundary_weight=0.0)(logits, target, weight))
+    on = float(FilamentLoss(boundary_weight=3.0)(logits, target, weight))
+    assert base == off, f"weight 0 must reproduce the old loss exactly: {base} vs {off}"
+    assert on != off, "a non-zero boundary weight must actually change the loss"
+
+    band = boundary_band(target, radius=2)
+    assert float(band[0, 0, 20, 26]) == 1.0, "the band must cover the mask edge"
+    assert float(band[0, 0, 5, 5]) == 0.0, "the band must be empty far from any mask"
+    interior = float((target * (1 - band)).sum())
+    assert interior > 0, "a 10px-wide bar must keep an interior at radius 2"
+
+    # BCE decomposes over pixels, so a per-pixel weight cannot move any pixel's
+    # optimum - which is what lets the boundary emphasis coexist with the
+    # calibration argument in losses.py, and what a Lovasz surrogate would break.
+    for w in (1.0, 7.0):
+        x = torch.zeros(1, requires_grad=True)
+        optimiser = torch.optim.LBFGS([x], max_iter=200)
+        t = torch.tensor([0.3])
+
+        def closure():
+            optimiser.zero_grad()
+            value = torch.nn.functional.binary_cross_entropy_with_logits(
+                x, t, reduction="none"
+            ) * w
+            value.sum().backward()
+            return value.sum()
+
+        optimiser.step(closure)
+        assert abs(float(torch.sigmoid(x)) - 0.3) < 1e-3, (
+            f"weighting moved the per-pixel optimum at w={w}; BCE would no longer "
+            f"be a proper scoring rule and threshold tuning would be invalid"
+        )
+
+
 @check("the submitted operating point is chosen by name, never by sort order")
 def _():
     # Both halves of this have already gone wrong once.  Sort order picked

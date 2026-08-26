@@ -61,10 +61,16 @@ def boundary_band(target: torch.Tensor, radius: int = 2) -> torch.Tensor:
     negative.  The target is binary per reading, so the difference is exactly the
     transition band.
 
-    Filaments are *thin*.  Erosion frequently removes a whole instance, in which
-    case the band covers all of it - which is correct rather than degenerate: for
-    a structure a few pixels across, every pixel is a boundary pixel, and that is
-    precisely why this metric is hard to score well on.
+    Measured on 244 real instances, the max-inscribed width is median 15.4 px
+    (p10 8.4, p90 29.7) - filaments are elongated but not hairline, and at
+    ``radius=2`` only 0.4% of instances erode away entirely (9.8% at radius 3).
+    So the band is a genuine rim of a few pixels either side of the edge rather
+    than the whole object, and radius is the knob that decides how much of a
+    ~15 px cross-section counts as "edge".
+
+    (An earlier version of this docstring asserted that erosion "frequently
+    removes a whole instance".  It does not, and the number above is why the
+    claim is now a measurement.)
     """
     kernel = 2 * radius + 1
     dilated = F.max_pool2d(target, kernel, stride=1, padding=radius)
@@ -115,8 +121,12 @@ class FilamentLoss(nn.Module):
         # Why here and not a Lovasz term: the metric matches at IoU > 0.5
         # strictly and scores each matched pair by its IoU, and the measured
         # sensitivity is about 1.06 PQ per unit of mean matched IoU
-        # (tools/iou_headroom.py).  Nearly all of that IoU is decided at the
-        # edges, because a filament is a few pixels across.
+        # (tools/iou_headroom.py).  A filament's cross-section is ~15 px, so a
+        # rim two pixels either side of the edge is a small share of its area but
+        # carries most of the disagreement: the predictions are only 8% too large
+        # by area (median_area_ratio 1.082), which is far too little to explain
+        # an IoU of 0.67 - so the loss is in *where* the edge sits, not in how
+        # big the mask is overall.
         #
         # Crucially this does *not* break the argument the module docstring makes
         # for BCE.  BCE decomposes over pixels, so a per-pixel weight leaves each
