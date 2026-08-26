@@ -210,6 +210,60 @@ that BCE is a proper scoring rule whose minimiser is P(a random annotator marks
 this pixel) - which is exactly what the operating-point tuning in
 `postprocess.py` assumes it is thresholding. Add a term; do not remove that one.
 
+## SQ saturates in six epochs and never moves again (26 Aug 2026)
+
+Read out of every stored `fold*_history.json`. The validation curves say two
+things, and the second one reframes the problem.
+
+**1. Thirty epochs is too many; every run peaks around 9-15 and then declines.**
+
+| run | epochs | best PQ | at epoch | PQ at the end |
+|---|---|---|---|---|
+| out_fix (B0) | 30 | 0.3884 | 15 | 0.363 |
+| out_b0 | 30 | 0.3364 | 10 | 0.310 |
+| out_f3 | 20 | 0.4050 | 15 | 0.395 |
+| out_f1 | 20 | 0.3846 | 9 | 0.368 |
+
+`*_best.pt` is selected on validation PQ, so results are not wrong - but roughly
+half of every 30-epoch run is spent getting worse. **Use ~20 epochs.** The 20-
+epoch runs peak in the same place as the 30-epoch ones, so this is overfitting
+rather than an artefact of the one-cycle schedule being stretched. (That caveat
+is real and worth keeping in mind: with one-cycle, epoch 15 of a 30-epoch
+schedule is at a different learning rate than epoch 15 of a 20-epoch one, so
+"peaks at 15" does not by itself license "train for 15".)
+
+**2. SQ is flat. All of the movement in PQ is RQ.**
+
+    out_fix SQ by epoch:  0.627 0.666 0.665 0.671 0.668 0.669 0.666 0.671 0.670 0.668
+    out_fix PQ by epoch:  0.258 0.337 0.355 0.377 0.388 0.387 0.360 0.357 0.363 0.363
+
+Mean matched IoU reaches ~0.67 by epoch 6 and then does not move for the
+remaining 24 epochs, while PQ swings by 0.13. Every run in the table sits in
+0.63-0.68, including both B4 runs (0.6595, 0.6647) which are **no better than
+B0's 0.6680**.
+
+So the model learns *where* filaments are - that is RQ, and it keeps improving -
+but the quality of its boundaries hits a wall almost immediately and stays there,
+regardless of training time, encoder, or fold.
+
+**This is the single most useful diagnostic in the project.** Combined with the
+headroom measurement (~1.06 PQ per unit of mean IoU) and the shape of the IoU
+distribution (one matched pair in 2501 above 0.90), it says the boundary ceiling
+is structural: it is not a matter of training longer, and the one capacity
+comparison available - confounded though it is - shows no SQ benefit either.
+
+It is *not* annotator disagreement. Out-of-fold PQ on single-annotator
+observations (0.4163), where an exact match is achievable by construction, equals
+the multi-annotator figure (0.4169).
+
+That leaves the objective. `FilamentLoss` is BCE plus a *semantic* soft-Dice
+pooled over the whole tile; neither term rewards putting an edge in exactly the
+right place, and predictions are only 8% too large by area, so the error is edge
+*position*, not mask size. **`--boundary-weight` is the direct test of this and
+is running now.** If it moves SQ off 0.67 it is worth far more than anything else
+on the list; if it does not, the next candidates are output resolution and tile
+size, not more epochs and not a bigger encoder.
+
 ## The CV-to-LB gap, and the unfinished fix
 
 CV 0.4167 -> LB 0.37, a gap of **-0.047**. Leading hypothesis: the operating
