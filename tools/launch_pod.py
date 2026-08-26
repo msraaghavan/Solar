@@ -215,6 +215,7 @@ def launch(argv: argparse.Namespace, passthrough: list[str]) -> None:
     # difference between two variants is a result or noise.
     env["SEED"] = str(argv.seed)
     env["BOUNDARY"] = str(argv.boundary)
+    env["FOLD"] = str(argv.fold)
 
     # Refuse to create a second pod under a tag that is already running.  Two
     # pods sharing a tag publish to the *same* Kaggle dataset, so they race and
@@ -307,6 +308,9 @@ def main() -> None:
     p.add_argument("--vcpus", type=int, default=8)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--boundary", type=float, default=0.0)
+    p.add_argument("--fold", type=int, default=0,
+                   help="which fold to train; five pods at folds 0-4 rebuild "
+                        "the whole ensemble in one fold's wall-clock")
     p.add_argument("--cuda", action="append", default=None,
                    help="acceptable host CUDA versions; repeatable")
     p.add_argument("--dry-run", action="store_true")
