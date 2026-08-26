@@ -24,19 +24,55 @@ needs the user's own Google login.
 The quantitative 70% is PQ **plus** the Dice distribution, the IoU distribution,
 and the one-to-many / many-to-one counts. Fragmentation is graded directly.
 
-## Current standing (25 Aug 2026)
+## Current standing (26 Aug 2026)
 
-- **One submission ever: public LB PQ 0.37**, rank ~39 of ~300.
-- Top of board is now **0.55 / 0.55 / 0.54 / 0.53**, then a gap to 0.40.
-- 13h ago the host said of those top scores: *"I would not compare very high
-  scores with mine. Any score higher than 0.35 is of great value for us and we
-  will examine them carefully."* A 12th-place competitor: *"I guess training with
-  test labels from original dataset."* 139-180 of the 180 test images have public
-  ground truth in the MAGFiLO 1.0 release. **We do not use the leak** — it is the
-  user's stated principle and the host says it will not be rewarded.
-- Our 0.37 already clears the host's stated 0.35 bar.
+**Rank 40 of 421, public LB PQ 0.37.** Two submissions ever, both 0.37.
 
-## The metric — verified, not assumed
+The leaderboard has a shape that matters more than our position in it:
+
+| rank | score |
+|---|---|
+| 1-2 | 0.55 |
+| 3 | 0.54 |
+| 4 | 0.53 |
+| **5-7** | **0.40** |
+| 8-10 | 0.39 |
+| **40 (us)** | **0.37** |
+
+There is a **0.13 discontinuity between rank 4 and rank 5** and almost nothing
+between 0.40 and 0.37. A gap that large in the top four, with a dense continuum
+below it, is the signature of a different *method*, not better tuning. A 12th
+place competitor said publicly: *"I guess training with test labels from original
+dataset."* 139-180 of the 180 test images have public ground truth in the MAGFiLO
+1.0 release. The host, unprompted: *"I would not compare very high scores with
+mine. Any score higher than 0.35 is of great value for us and we will examine
+them carefully."*
+
+**We do not use the leak.** So the honest target is the top of the lower cohort,
+not the top of the board:
+
+- **+0.02 reaches rank 10.** +0.03 reaches rank 5.
+- **+0.05 (LB ~0.42) would be first in the honest cohort** and 5th overall.
+- Rank 3 needs **+0.17**, which would mean CV ~0.59 against a measured ceiling of
+  0.7687. Not impossible, but nothing identified is worth that on its own.
+
+Since judging is 70% quantitative + 30% qualitative and *not* leaderboard rank,
+being demonstrably the best leak-free submission is the winning position, and the
+paired unconfounded experiments are what make that case.
+
+## Calibration: a clean null result (26 Aug 2026)
+
+The calibrated operating point (seed 0.950 -> 0.929, mask 0.400 -> 0.392) scored
+**0.37 - identical to the uncalibrated submission** at the two decimals Kaggle
+reports. It moved instances/image from 6.083 to 6.433, so it did what it was
+designed to do; it just was not worth anything.
+
+Taken with the measurement itself - both the train-side and test-side estimators
+agree the threshold only moves ~0.02 - **the ensemble operating point is settled
+and closed.** It was never the explanation for the -0.047 CV-to-LB gap, and no
+further effort belongs there. What remains is generalisation and mask quality.
+
+## The metric — verified, not assumed## The metric — verified, not assumed
 
 The host published a self-evaluation notebook and confirmed on 13 Aug that it
 "has the exact implementation of PQ". `tests/test_official_metric.py`
