@@ -31,7 +31,12 @@ import subprocess
 import sys
 import tempfile
 
-BASELINE = ("spine=0", "bnd=0", "stem=0")
+# An axis absent from a label means that axis did not exist when the pod ran,
+# which is not a difference - it means the default.  Requiring the literal text
+# "stem=0" made every pod launched before the stem axis existed unrecognisable
+# as a baseline, so the whole comparison silently reported nothing.  It failed
+# safe, but it failed.
+DEFAULT_AXES = {"spine": 0.0, "bnd": 0.0, "stem": 0.0, "tile": 512.0}
 
 
 def fetch(tag: str, into: str) -> str | None:
@@ -68,8 +73,26 @@ def parse(text: str) -> tuple[dict, list[dict]]:
     return header, rows
 
 
+def axes(label: str) -> dict:
+    """The configuration a job ran, read out of its summary label."""
+    written = dict(re.findall(r"([a-z_]+)=([-\d.]+)", label))
+    values = {k: float(written.get(k, default)) for k, default in DEFAULT_AXES.items()}
+    # The encoder is the first token, and it is part of the identity: a B4
+    # baseline is not the same configuration as a B0 baseline.
+    values["encoder"] = label.split()[0] if label.split() else "?"
+    return values
+
+
 def is_baseline(label: str) -> bool:
-    return all(part in label for part in BASELINE)
+    values = axes(label)
+    return all(values[k] == default for k, default in DEFAULT_AXES.items())
+
+
+def treatment_of(label: str, base: str) -> str:
+    """What this job changed relative to its pod's baseline."""
+    a, b = axes(label), axes(base)
+    changed = [f"{k}: {b[k]} -> {a[k]}" for k in a if a[k] != b[k]]
+    return ", ".join(changed) or "(identical)"
 
 
 def main() -> None:
@@ -116,6 +139,10 @@ def main() -> None:
             print(f"  {tag:<13}PQ {row['PQ']:.4f}   SQ {row['SQ']:.4f}   {row['label'][:40]}")
         pq = [row["PQ"] for _, row in baselines]
         sq = [row["SQ"] for _, row in baselines if row["SQ"] is not None]
+        encoders = {axes(row["label"])["encoder"] for _, row in baselines}
+        if len(encoders) > 1:
+            print(f"  WARNING: baselines span {encoders}; that is not one "
+                  f"configuration and the spread below is not a noise floor.")
         floor = max(pq) - min(pq)
         print(f"  spread: PQ {floor:.4f}   SQ {max(sq) - min(sq):.4f}"
               f"   over {len(baselines)} runs of the same configuration")
@@ -139,7 +166,7 @@ def main() -> None:
                 verdict = f"within noise ({floor:.4f})"
             else:
                 verdict = "EXCEEDS NOISE" + (" - improvement" if d_pq > 0 else " - regression")
-            treatment = row["label"].replace(base["label"].split()[0], "").strip()
+            treatment = treatment_of(row["label"], base["label"])
             print(f"  {tag:<13}{treatment[:40]:<42}"
                   f"dPQ {d_pq:+.4f}  dSQ {d_sq:+.4f}   {verdict}")
 
