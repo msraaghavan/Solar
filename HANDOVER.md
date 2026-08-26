@@ -124,6 +124,56 @@ over-segment by 8%, so growing instances is the wrong direction and
 emit nothing, a guaranteed loss since **no training reading has zero filaments**
 (minimum 1, mean 7.1).
 
+## Mask quality is the largest lever, measured (26 Aug 2026)
+
+`tools/iou_headroom.py` reads the stored matched-IoU distribution out of an OOF
+artefact and asks what a uniform change in mask quality would be worth. On
+`out_ooffull` (2501 matched pairs, PQ 0.4167):
+
+| uniform IoU shift | PQ | delta |
+|---|---|---|
+| -0.05 | 0.3597 | -0.057 |
+| +0.02 | 0.4391 | **+0.022** |
+| +0.05 | 0.4700 | **+0.053** |
+| +0.10 | 0.5225 | **+0.106** |
+
+The response is very nearly linear at about **1.06 PQ per unit of mean IoU**, in
+both directions. Three things follow, and they reorder the priority list:
+
+1. **This dominates the near-miss lever.** Converting *every one* of the 321 near
+   misses at IoU 0.6 gives 0.4643 (+0.048) - less than a uniform +0.05 shift,
+   because that shift also lifts all 2501 pairs that already match. Chasing the
+   cliff alone is the smaller half of the opportunity.
+2. **The distribution has no upper tail.** Matched IoUs peak at 0.65-0.75 and
+   exactly **one** pair out of 2501 exceeds 0.90. The model never draws a nearly
+   correct boundary, on any instance. That is not what a label-noise ceiling
+   looks like; it is what limited capacity or a mismatched objective looks like.
+3. **8.9% of matches (223) sit below IoU 0.55** and are one small regression away
+   from becoming a false positive *and* a false negative. The -0.05 row is the
+   same statement from the other side: mask quality is the dominant sensitivity
+   of this metric, in both directions.
+
+**The objective does not optimise what the metric measures.** `FilamentLoss` is
+`BCE + 0.5 * soft_dice`, and that Dice is computed over the whole tile with every
+filament pooled - it is a *semantic* overlap term. The metric scores *per
+instance* IoU. The gap is visible in the run's own diagnostics: mean semantic
+Dice 0.6517 against mean matched Dice 0.8027.
+
+Candidates, in order of how well they fit the evidence:
+
+- a boundary-weighted term (filaments are thin, so boundary pixels are a large
+  fraction of each mask and errors there dominate IoU);
+- a Lovász-hinge term alongside the existing pair, which is a direct surrogate
+  for IoU;
+- more capacity, which the B0-vs-B4 pod is testing right now - `evaluate_fold`
+  reports SQ, which *is* mean matched IoU, so that run measures this lever
+  directly.
+
+**Do not simply replace BCE.** The docstring in `losses.py` argues, correctly,
+that BCE is a proper scoring rule whose minimiser is P(a random annotator marks
+this pixel) - which is exactly what the operating-point tuning in
+`postprocess.py` assumes it is thresholding. Add a term; do not remove that one.
+
 ## The CV-to-LB gap, and the unfinished fix
 
 CV 0.4167 -> LB 0.37, a gap of **-0.047**. Leading hypothesis: the operating
