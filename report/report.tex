@@ -3,8 +3,8 @@
 % Requires: amsmath, booktabs, graphicx, tikz.
 %
 % Every number here is produced by code in this repository and is reproducible
-% from it.  Sections marked RESULTS-PENDING are filled from tools/compare_pods.py
-% once the running ablations report; nothing else depends on them.
+% from it, and tools/check_report.py asserts every quoted figure against the
+% out-of-fold artefact.  Ablation figures come from tools/compare_pods.py.
 
 \section{Problem and approach}
 
@@ -140,10 +140,48 @@ $+0.10$ & 0.5225 & $+0.106$ \\
 
 \subsection{Ablations}
 
-% RESULTS-PENDING: filled from tools/compare_pods.py.  Each row is measured
-% against its own baseline trained on the same card, in the same precision,
-% under the same code version and seed; the noise floor is the spread between
-% identical baseline runs and is quoted so the reader can judge significance.
+Each treatment was trained against its own baseline on the same GPU, in the same
+precision, under the same code version and seed, so that the two arms differ in
+exactly one variable. Significance is judged against a measured noise floor
+rather than asserted: four identical baselines trained across four machines span
+\textbf{0.0072} in PQ and 0.0056 in SQ.
+
+\begin{table}[t]
+\centering
+\caption{Paired ablations, fold 0. Noise floor $\Delta\mathrm{PQ} = 0.0072$.}
+\begin{tabular}{lrrl}
+\toprule
+treatment & $\Delta$PQ & $\Delta$SQ & verdict \\
+\midrule
+EfficientNet-B4 vs B0 (bf16) & $-0.0005$ & $+0.0047$ & within noise \\
+spine head, weight 0.3 & $-0.0060$ & $+0.0038$ & within noise \\
+boundary-weighted BCE & $-0.0012$ & $+0.0005$ & within noise \\
+stride-1 stem skip & $-0.0086$ & $-0.0022$ & regression \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two deserve comment.
+
+\textbf{The recorded B4 penalty was an artefact of precision.} B4 stood at
+$-0.021$ against B0. That measurement was taken on a Turing T4 in fp16, where B4
+overflowed and the gradient scaler silently discarded the affected steps, so it
+could not distinguish a worse model from an undertrained one. Repeated on Ampere
+in bf16, which carries fp32's exponent range, the penalty is $-0.0005$: it does
+not exist. B4 is therefore a candidate \emph{ensemble member} rather than a
+replacement, and that is how we use it.
+
+\textbf{The spine head does not reduce fragmentation.} It is the most promising
+idea available on paper --- the organisers permit the metadata explicitly and
+name structural continuity as a core challenge --- but one-to-many counts are
+unchanged (42 against 42) while precision falls from 0.6405 to 0.6177 on 29
+additional predictions.
+
+Together with the training curves, these rule out training length, numerical
+precision, hardware, encoder capacity, edge-weighted loss and full-resolution
+decoder input as explanations for the SQ ceiling. We report them because a
+negative result measured against a noise floor is worth more than an untested
+idea described as promising.
 
 \section{Negative results}
 
@@ -164,11 +202,12 @@ $\text{seed} = 0.950 \rightarrow 0.929$, raises predicted instances per image
 from 6.08 to 6.43 as intended, and scored \emph{identically} to the
 uncalibrated submission. The operating point was not the problem.
 
-\textbf{Capacity, as previously measured, was confounded.} EfficientNet-B4
-scored $-0.021$ against B0 --- but on a Turing T4 in fp16, where B4 overflowed
-and the gradient scaler silently dropped the offending steps. That run cannot
-distinguish ``worse'' from ``undertrained''. We re-tested it on Ampere hardware
-in bf16, which carries fp32's exponent range and cannot overflow that way.
+\textbf{The empty-observation fallback does not pay.} Ten of 707 observations
+emit nothing, which is certainly wrong: no training reading contains zero
+filaments. We added the rescue as a \emph{tunable axis} rather than as a
+correction applied on the strength of the argument, and the tuner rejected it ---
+refitting with the axis available scores 0.4147 on held-out data against 0.4167
+without it.
 
 \section{Strengths, weaknesses, and what we would do next}
 
