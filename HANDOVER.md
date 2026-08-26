@@ -275,6 +275,68 @@ it to that block. If it moves SQ off 0.67 it is worth far more than anything els
 on the list; if it does not, the next candidates are output resolution and tile
 size, not more epochs and not a bigger encoder.
 
+## Ablations, 26 Aug 2026 — four hypotheses, four negatives
+
+Every arm paired against its own baseline on the same card, precision, code
+version and seed. Fold 0 except where noted. Read with `tools/compare_pods.py`.
+
+**Noise floor first, because nothing below means anything without it.** Four
+identical B0 baselines across four pods: PQ 0.4286 / 0.4335 / 0.4335 / 0.4358,
+**spread 0.0072** (SQ spread 0.0056). Two of those are bit-identical (same GPU
+model, same seed), so the floor is dominated by GPU model and seed - neither of
+which varies *within* a pod, which is why the pairing is done that way.
+
+| treatment | dPQ | dSQ | verdict |
+|---|---|---|---|
+| EfficientNet-B4 vs B0 (bf16) | **-0.0005** | +0.0047 | within noise |
+| spine head, weight 0.3 | -0.0060 | +0.0038 | within noise |
+| boundary-weighted BCE, weight 3 | -0.0012 | +0.0005 | within noise |
+| stride-1 stem skip | -0.0086 | -0.0022 | **regression** |
+| pooled OOF refit with `fallback_min_area` | -0.0020 | -0.0008 | worse; not used |
+
+**The B4 result is a correction, and it matters.** B4 was on record at -0.021
+against B0. That was measured on a T4 in fp16, where B4 overflowed and
+GradScaler silently dropped the offending steps. In bf16 on Ampere the penalty
+is **-0.0005** - it does not exist. The handover called this "the most important
+open question"; it is answered, and the previous answer was an artefact of
+precision.
+
+What follows from it is the useful part: **B4 is an ensemble member, not a
+replacement.** Two architectures of equal quality averaged together is the most
+reliable remaining gain, and B4 posted the largest dSQ of the four arms.
+
+**The spine head did not do what it was built for.** Fragmentation is identical:
+one-to-many 42 -> 42, many-to-one 19 -> 17, while precision fell 0.6405 ->
+0.6177 on 29 more predictions. This was the handover's "single most promising
+untested idea", host-sanctioned and aimed at the structural continuity they name
+as a core challenge. It is a clean null.
+
+**Everything that has now been ruled out for the SQ ceiling:** training length,
+precision (fp16 vs bf16), hardware, encoder capacity, edge-weighted loss, and
+full-resolution decoder input. That is most of the obvious space.
+
+## The achievable ceiling, recomputed correctly (26 Aug 2026)
+
+Scoring each annotator's own masks as *the* prediction against **all** readings
+of that observation - self-match included, exactly as the real scorer treats our
+single prediction:
+
+| | SQ | RQ | PQ |
+|---|---|---|---|
+| human as predictor, all 707 | 0.8742 | 0.7709 | 0.6739 |
+| human as predictor, multi-annotator only | 0.8307 | 0.7144 | 0.5934 |
+| **our model** | 0.6748 | 0.6175 | 0.4167 |
+
+**Headroom is roughly +0.20 in SQ and +0.15 in RQ.** Both are real.
+
+**Do not compute this the other way.** Annotator-A-against-annotator-B gives SQ
+0.6307 / RQ 0.5211 / PQ 0.3286, which makes our model look *better than human*
+and the task look finished. That comparison excludes the self-match the real
+scorer always includes, and it is the same error the handover already warns
+about - it was made again on 26 Aug and caught within minutes. The single-vs-
+multi-annotator equality (OOF 0.4163 vs 0.4169) remains the decisive evidence
+that disagreement is not the binding constraint.
+
 ## The CV-to-LB gap, and the unfinished fix
 
 CV 0.4167 -> LB 0.37, a gap of **-0.047**. Leading hypothesis: the operating
