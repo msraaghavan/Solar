@@ -1,0 +1,206 @@
+% Body text for the 4-page IEEE BigData Cup report.  Paste into the organisers'
+% Overleaf template (kaggle_comp_report_fi_segm_2026.pdf) below its title block.
+% Requires: amsmath, booktabs, graphicx, tikz.
+%
+% Every number here is produced by code in this repository and is reproducible
+% from it.  Sections marked RESULTS-PENDING are filled from tools/compare_pods.py
+% once the running ablations report; nothing else depends on them.
+
+\section{Problem and approach}
+
+We segment individual solar filaments in 2048$\times$2048 GONG H$\alpha$
+full-disk images. The training set is 707 observations carrying 1154 annotator
+readings; 42\% of observations are read by more than one annotator, and those
+annotators agree only moderately. The evaluation set is 180 images.
+
+Our system is a U-Net decoder over an ImageNet-pretrained EfficientNet-B0
+encoder, trained on 512-pixel tiles and applied to whole observations by
+cosine-blended tiling. Three choices are specific to this problem rather than
+inherited from a standard recipe.
+
+\textbf{Geometry-aware preprocessing.} The solar disk is fitted per image and
+limb darkening removed by a radial flat field, so that a filament of given
+contrast presents the same way at disk centre and near the limb. Features are
+standardised against constants fixed once across the corpus, and every
+off-disk pixel is excluded from both loss and metric.
+
+\textbf{A decoder that reaches full resolution.} Standard timm encoders stride
+the input by 32 and the usual U-Net stops decoding at stride 2, upsampling
+logits at the end. Filament barbs are a few pixels wide, so our decoder runs
+back to stride 1 with learned blocks and deep supervision at strides 2 and 4.
+
+\textbf{A loss matched to a stochastic target.} Because a third of images carry
+multiple readings, the per-pixel target is genuinely random: the correct thing
+to predict is $P(\text{a randomly drawn annotator marks this pixel})$. Binary
+cross-entropy is a proper scoring rule, so its minimiser \emph{is} that
+posterior, which is what makes the later threshold search meaningful. Soft Dice
+is added at low weight purely as a conditioner on the 0.3\% positive rate.
+
+Instances are extracted by hysteresis thresholding (a strict seed level, a
+looser extent level) followed by connected components, with morphological
+closing and area filters. Every one of those decision parameters is fitted
+against Panoptic Quality itself rather than against a proxy.
+
+\section{Validation methodology}
+
+The competition metric is Panoptic Quality,
+\begin{equation}
+\mathrm{PQ} = \frac{\sum_{(p,g)\in \mathrm{TP}} \mathrm{IoU}(p,g)}
+                   {|\mathrm{TP}| + \tfrac12|\mathrm{FP}| + \tfrac12|\mathrm{FN}|},
+\end{equation}
+matching at $\mathrm{IoU} > 0.5$ strictly and pooled over every
+annotator--image entry. We re-implemented the organisers' rules independently
+and assert agreement between the two implementations on hand-computed cases,
+multi-annotator observations, images with no ground truth and images with no
+prediction (7 automated checks). We did this because two of our own early
+conclusions turned on metric details --- fragmentation counting uses
+\emph{any} overlap, not a threshold --- and a metric taken on trust is a
+result taken on trust.
+
+Splits are five-fold and stratified by observing site, so that a fold never
+scores an instrument it has also trained on. Two further precautions matter:
+
+\begin{itemize}
+\item \textbf{Splits separate observations, not readings.} An observation read
+by three annotators yields three scoring entries. Splitting on entries put
+59.8\% of nominally held-out observations into the tuning half as well. This
+was a real defect in our own earlier work, found by a test that now guards it.
+\item \textbf{Operating points are fitted and reported on disjoint halves.}
+Fitting the decision parameters on the same data they are reported on inflates
+PQ; measured directly, that selection optimism is $+0.0024$ for our pooled fit.
+\end{itemize}
+
+\section{Results}
+
+Five-fold cross-validation with per-fold operating points gives
+$\mathrm{PQ} = 0.3946 \pm 0.0113$. Pooling the out-of-fold predictions and
+fitting one operating point over all of them gives \textbf{PQ 0.4167},
+reported on 353 observations disjoint from the 354 used to fit. Our public
+leaderboard score is 0.37.
+
+\begin{table}[t]
+\centering
+\caption{Out-of-fold error decomposition, 707 observations.}
+\begin{tabular}{lr@{\hskip 2em}lr}
+\toprule
+PQ & 0.4167 & one-to-many & 144 \\
+SQ (mean matched IoU) & 0.6748 & many-to-one & 70 \\
+RQ & 0.6175 & mean matched Dice & 0.8027 \\
+true positives & 2501 & mean semantic Dice & 0.6517 \\
+false positives & 1458 & precision & 0.632 \\
+false negatives & 1640 & hit rate & 0.604 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What limits the score}
+
+We measured the achievable ceiling directly, by scoring each annotator's own
+masks against every reading of the same image under the real metric. A method
+emitting human-quality masks would score \textbf{0.7687} overall: 1.0 on the
+411 single-annotator observations, 0.6307 on the 296 multi-annotator ones.
+
+It is tempting to conclude that annotator disagreement is what bounds us. It is
+not, and the evidence is direct: out-of-fold PQ on single-annotator
+observations, where an exact match is achievable by construction, is
+\textbf{0.4163}, against \textbf{0.4169} on multi-annotator observations. If
+disagreement bound us we would score far better where there is none.
+
+The binding constraint is mask quality, and it is remarkably rigid. Mean
+matched IoU reaches $\approx 0.67$ by epoch six and does not move for the
+remaining 24 epochs, while PQ swings by 0.13 through recognition alone. Every
+run we have trained --- both encoders, all five folds, 20-epoch and 30-epoch
+schedules --- lands between 0.63 and 0.68. Exactly one matched pair in 2501
+exceeds IoU 0.90.
+
+That rigidity matters because the metric is unusually sensitive to it. Shifting
+every instance's IoU by a constant and recomputing PQ gives a near-linear
+response of \textbf{1.06 PQ per unit of mean IoU} (Table~\ref{tab:headroom}) ---
+so $+0.05$ IoU is worth more than converting \emph{every} one of our 321
+near-miss instances (unmatched ground truth in IoU 0.4--0.5), which is worth
+$+0.048$. Predictions are only 8\% too large by area, far too little to explain
+an IoU of 0.67, so the error is in \emph{where} the boundary sits rather than
+how large the mask is.
+
+\begin{table}[t]
+\centering
+\caption{PQ under a uniform shift in every instance's IoU.}
+\label{tab:headroom}
+\begin{tabular}{rrr}
+\toprule
+IoU shift & PQ & $\Delta$ \\
+\midrule
+$-0.05$ & 0.3597 & $-0.057$ \\
+$+0.02$ & 0.4391 & $+0.022$ \\
+$+0.05$ & 0.4700 & $+0.053$ \\
+$+0.10$ & 0.5225 & $+0.106$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablations}
+
+% RESULTS-PENDING: filled from tools/compare_pods.py.  Each row is measured
+% against its own baseline trained on the same card, in the same precision,
+% under the same code version and seed; the noise floor is the spread between
+% identical baseline runs and is quoted so the reader can judge significance.
+
+\section{Negative results}
+
+We report these because they were expensive to establish and because two of
+them corrected conclusions we had previously drawn.
+
+\textbf{Label smoothing (0.05) costs $-0.011$.} Against an older code version it
+appeared to gain $+0.022$. It does not; the apparent gain was a comparison
+across code versions.
+
+\textbf{Ensemble threshold calibration is worth nothing measurable.} Our
+operating point is fitted on single-model out-of-fold maps but applied to a
+five-model average, and averaging shaves probability peaks, so the same
+threshold admits less. We built a label-free correction that holds admitted
+pixel mass fixed rather than the threshold, and measured it on the test images'
+probability histograms (test pixels, never test labels). It moves
+$\text{seed} = 0.950 \rightarrow 0.929$, raises predicted instances per image
+from 6.08 to 6.43 as intended, and scored \emph{identically} to the
+uncalibrated submission. The operating point was not the problem.
+
+\textbf{Capacity, as previously measured, was confounded.} EfficientNet-B4
+scored $-0.021$ against B0 --- but on a Turing T4 in fp16, where B4 overflowed
+and the gradient scaler silently dropped the offending steps. That run cannot
+distinguish ``worse'' from ``undertrained''. We re-tested it on Ampere hardware
+in bf16, which carries fp32's exponent range and cannot overflow that way.
+
+\section{Strengths, weaknesses, and what we would do next}
+
+\textbf{Strengths.} The metric is independently verified rather than assumed.
+Every reported number comes from a split that separates observations, with
+selection optimism measured rather than hoped away. The achievable ceiling is
+measured, not argued. Ablations are paired within a single machine, precision
+and code version, because a difference measured across any of those is not a
+difference.
+
+\textbf{Weaknesses.} Mean matched IoU is the binding constraint and we have not
+moved it. Fragmentation persists (144 one-to-many, 70 many-to-one). Ten of 707
+observations emit nothing at all, which is certainly wrong: no training reading
+contains zero filaments. And a $-0.047$ gap between cross-validation and the
+leaderboard remains unexplained now that calibration is excluded.
+
+\textbf{Next.} The objective does not optimise what the metric measures: our
+Dice term is semantic, pooled over the whole tile, while PQ scores per-instance
+IoU. A boundary-weighted term, applied as a per-pixel re-weighting of BCE so
+that the proper-scoring-rule property survives, is the direct test and costs
+nothing to reject. Beyond that, the auxiliary spine head --- explicitly
+sanctioned by the organisers, and targeting the structural continuity they name
+as a core challenge --- and self-supervised pretraining on unlabelled GONG
+H$\alpha$ are the two levers with the most room left.
+
+\section{Reproducibility}
+
+All code, tests and tooling are at \url{https://github.com/msraaghavan/Solar}
+under MIT, with \texttt{requirements.txt} pinning the runtime the submitted
+results were produced on. The pipeline notebook is generated from the same
+source it documents, so it cannot drift from it. The test suite is 51 checks
+and needs no GPU; several of them encode defects found in this project's own
+earlier work, including the reading-level split leak, a censored tuning grid,
+and a fragmentation rule that used a threshold where the organisers' uses any
+overlap.
