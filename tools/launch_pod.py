@@ -74,16 +74,23 @@ DEFAULT_GPUS = [
 # makes the host pool as wide as it can safely be.
 DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2204"
 
-# Hosts this cu128 image runs on.  A driver *older* than the image's CUDA fails
-# with error 804 ("forward compatibility ... on non supported HW"), so 12.8 is
-# the floor.  CUDA 13.0 hosts failed too, in the other direction - "CUDA unknown
-# error" on an RTX 4090 nvidia-smi described perfectly, three times on three
-# separate 580.x hosts - but that has a cause and a fix, applied in the start
-# command: the container's own forward-compat libraries shadow the newer host
-# driver.  13.0 is back on the list because excluding it roughly halved the
-# schedulable pool, and "no instances currently available" is the failure that
-# actually blocks work.
-ALLOWED_CUDA = ["12.8", "12.9", "13.0"]
+# Hosts this cu128 image runs on, established entirely by failure.
+#
+# A driver *older* than the image's CUDA fails with error 804 ("forward
+# compatibility ... on non supported HW"), so 12.8 is the floor.
+#
+# CUDA **13.0** hosts fail too, in the other direction: torch initialises to
+# "CUDA unknown error" and sees no device on a card nvidia-smi describes
+# perfectly.  Four pods, four separate 580.x hosts.  I guessed the cause was the
+# container's own forward-compatibility libraries shadowing the newer host driver
+# and added a retry that removes them - it runs, removes them, and **torch still
+# sees no device**.  So that explanation is wrong, the real cause is unknown, and
+# the only supported statement is the empirical one: 13.0 hosts do not work.
+#
+# The retry is kept because it is free and harmless, not because it works.
+# Excluding 13.0 does narrow the pool - "no instances currently available" is a
+# real answer - but a host that cannot run the job is worth less than no host.
+ALLOWED_CUDA = ["12.8", "12.9"]
 
 
 def request(method: str, path: str, body: dict | None = None) -> object:
@@ -187,13 +194,12 @@ def start_command(args_line: str, hours: int) -> str:
             "}",
             "",
             "if ! gpu_ok; then",
-            "  # /usr/local/cuda/compat holds forward-compatibility libraries, whose",
-            "  # job is to let an OLD driver run a NEWER toolkit.  On a host whose",
-            "  # driver is NEWER than the image - every CUDA 13.0 host we landed on -",
-            "  # they instead shadow a perfectly good driver, and torch reports",
-            "  # 'CUDA unknown error' on a card nvidia-smi describes correctly.",
-            "  # Removing them lets torch use the host driver, which is backward",
-            "  # compatible with this image's cu128 binaries.",
+            "  # A guess, kept because it is free: /usr/local/cuda/compat holds",
+            "  # forward-compatibility libraries meant to let an OLD driver run a",
+            "  # NEWER toolkit, so on a host whose driver is newer than the image",
+            "  # they might shadow a working driver.  Measured: on CUDA 13.0 hosts",
+            "  # removing them does NOT help - torch still sees no device.  It has",
+            "  # never yet rescued a pod.  ALLOWED_CUDA is what actually works.",
             "  echo 'retrying without the container CUDA forward-compat libraries'",
             "  export LD_LIBRARY_PATH=$(python -c \"import os;"
             "print(':'.join(p for p in os.environ.get('LD_LIBRARY_PATH','').split(':')"
