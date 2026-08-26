@@ -404,7 +404,7 @@ for job in "${JOBS[@]}"; do
     pq=$(grep -oE 'PQ \(micro\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
     sq=$(grep -oE 'SQ \(seg quality\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
     rq=$(grep -oE 'RQ \(recognition\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
-    label="$ENCODER  spine=$weight  bnd=$BOUNDARY  stem=$STEM  tile=$TILE  seed=$SEED"
+    label="$ENCODER  spine=$weight  bnd=$BOUNDARY  stem=$STEM  tile=$TILE  bs=$BATCH  ep=$EPOCHS  seed=$SEED"
     echo "$label  PQ=${pq:-unknown}  SQ=${sq:-?}  RQ=${rq:-?}" >> "$SUMMARY"
     publish_to_kaggle light || true
 done

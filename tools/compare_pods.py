@@ -36,7 +36,8 @@ import tempfile
 # "stem=0" made every pod launched before the stem axis existed unrecognisable
 # as a baseline, so the whole comparison silently reported nothing.  It failed
 # safe, but it failed.
-DEFAULT_AXES = {"spine": 0.0, "bnd": 0.0, "stem": 0.0, "tile": 512.0}
+DEFAULT_AXES = {"spine": 0.0, "bnd": 0.0, "stem": 0.0, "tile": 512.0,
+                "bs": 8.0, "ep": 30.0}
 
 
 def fetch(tag: str, into: str) -> str | None:
