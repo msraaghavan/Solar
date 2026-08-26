@@ -166,6 +166,19 @@ def start_command(args_line: str, hours: int) -> str:
             "nvidia-smi || echo 'NO nvidia-smi'",
             "python -V || echo 'NO python'",
             "df -h /workspace",
+            "",
+            "# Prove the GPU is usable before paying for anything else.  A",
+            "# Community host can present a perfectly healthy card to nvidia-smi",
+            "# while torch gets 'CUDA unknown error' and sees no device - two pods",
+            "# that landed on the same machine both failed exactly that way.",
+            "# Without this check the failure surfaces only after pip installs and",
+            "# a 751 MB download, so a dead host costs minutes instead of seconds",
+            "# and the retry is correspondingly slower.",
+            "python -c \"import torch;"
+            "assert torch.cuda.is_available(), 'torch sees no CUDA device';"
+            "torch.randn(64,64,device='cuda').sum().item();"
+            "print('GPU OK:', torch.cuda.get_device_name(0))\""
+            " || { echo 'HOST GPU UNUSABLE - abandoning this pod'; exit 1; }",
             "command -v git >/dev/null ||"
             " (apt-get update -qq && apt-get install -y -qq git curl unzip)",
             "cd /workspace || exit 1",
@@ -191,6 +204,23 @@ def launch(argv: argparse.Namespace, passthrough: list[str]) -> None:
     # measurement of run-to-run spread, and that number is what says whether a
     # difference between two variants is a result or noise.
     env["SEED"] = str(argv.seed)
+
+    # Refuse to create a second pod under a tag that is already running.  Two
+    # pods sharing a tag publish to the *same* Kaggle dataset, so they race and
+    # overwrite each other's results, and both bill.  This is not hypothetical:
+    # a retry loop whose exit status was misread launched a duplicate, and only
+    # a listing caught it.
+    existing = [
+        p for p in request("GET", "/pods")
+        if isinstance(p, dict) and p.get("name") == f"filament-{argv.tag}"
+    ]
+    if existing and not argv.force:
+        raise SystemExit(
+            f"a pod named filament-{argv.tag} is already running "
+            f"({', '.join(p.get('id', '?') for p in existing)}).  It publishes to the "
+            f"same Kaggle dataset, so a second one would race it and bill twice.  "
+            f"Use a different --tag, kill that pod, or pass --force if you mean it."
+        )
 
     args_line = " ".join(passthrough)
     body = {
@@ -268,6 +298,8 @@ def main() -> None:
     p.add_argument("--cuda", action="append", default=None,
                    help="acceptable host CUDA versions; repeatable")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="create even if a pod with this tag is already running")
 
     sub.add_parser("list")
     k = sub.add_parser("kill")
