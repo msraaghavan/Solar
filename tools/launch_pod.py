@@ -74,9 +74,19 @@ DEFAULT_GPUS = [
 # makes the host pool as wide as it can safely be.
 DEFAULT_IMAGE = "runpod/pytorch:1.1.0-cu1281-torch280-ubuntu2204"
 
-# Hosts whose driver is at least as new as the image's CUDA.  Without this,
-# RunPod is free to place the pod on an 12.6 host and the run dies at bootstrap.
-ALLOWED_CUDA = ["12.8", "12.9", "13.0"]
+# Hosts this cu128 image actually runs on, established by failure rather than by
+# reasoning about compatibility.  A driver *older* than the image's CUDA fails
+# with error 804 ("forward compatibility ... on non supported HW"), which is the
+# expected direction.  But CUDA **13.0** hosts fail too, in the other direction:
+# torch initialises to "CUDA unknown error" and sees no device on an RTX 4090
+# that nvidia-smi describes perfectly.  Observed three times on three separate
+# 580.x hosts, while every 570.x host worked.  Backward compatibility says this
+# should be fine; it is not, so the list is empirical.
+#
+# If a future image is built against CUDA 13, add "13.0" back and drop the older
+# entries - the rule is that the host driver and the image should agree, not
+# merely be ordered.
+ALLOWED_CUDA = ["12.8", "12.9"]
 
 
 def request(method: str, path: str, body: dict | None = None) -> object:
@@ -204,6 +214,7 @@ def launch(argv: argparse.Namespace, passthrough: list[str]) -> None:
     # measurement of run-to-run spread, and that number is what says whether a
     # difference between two variants is a result or noise.
     env["SEED"] = str(argv.seed)
+    env["BOUNDARY"] = str(argv.boundary)
 
     # Refuse to create a second pod under a tag that is already running.  Two
     # pods sharing a tag publish to the *same* Kaggle dataset, so they race and
@@ -295,6 +306,7 @@ def main() -> None:
     p.add_argument("--disk", type=int, default=60)
     p.add_argument("--vcpus", type=int, default=8)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--boundary", type=float, default=0.0)
     p.add_argument("--cuda", action="append", default=None,
                    help="acceptable host CUDA versions; repeatable")
     p.add_argument("--dry-run", action="store_true")

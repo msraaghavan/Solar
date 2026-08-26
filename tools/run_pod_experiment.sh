@@ -48,6 +48,9 @@ EPOCHS=${EPOCHS:-30}
 # spread gets measured, and that number is what decides whether a difference
 # between two variants is a result or noise.
 SEED=${SEED:-1234}
+# Extra BCE weight on pixels near a mask edge.  0 reproduces every earlier
+# result exactly, which is why it is the default.
+BOUNDARY=${BOUNDARY:-0}
 BASELINE=${BASELINE:-1}    # also run spine-weight 0 on this pod; see below
 SMOKE=0
 
@@ -292,7 +295,7 @@ WORKERS=$(( $(nproc) > 32 ? 32 : $(nproc) ))
     echo "gpu: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)"
     echo "vcpus: $(nproc)  workers: $WORKERS"
     echo "queue: ${JOBS[*]}"
-    echo "seed: $SEED"
+    echo "seed: $SEED   boundary-weight: $BOUNDARY"
     echo "bootstrap: ok (data fetched, both test suites passed)"
 } > "$SUMMARY"
 
@@ -312,13 +315,14 @@ for job in "${JOBS[@]}"; do
     weight="${job##*|}"
     # Tags every artefact for this job.  It has to carry the encoder as well as
     # the weight, or a two-encoder queue silently overwrites its own results.
-    tag="${ENCODER#tf_efficientnet_}_spine${weight}_seed${SEED}"
+    tag="${ENCODER#tf_efficientnet_}_spine${weight}_bnd${BOUNDARY}_seed${SEED}"
     echo ""
     echo "=== fold $FOLD, encoder $ENCODER, spine-weight $weight ==="
     default_val=(--val-every 3 --val-files 40)
     [ "$SMOKE" = "1" ] && default_val=()
     python src/train.py \
         --fold "$FOLD" --encoder "$ENCODER" --seed "$SEED" \
+        --boundary-weight "$BOUNDARY" \
         --tile-size 512 --batch-size 8 --tiles-per-sample 8 \
         --epochs "$EPOCHS" "${default_val[@]}" "${SMOKE_ARGS[@]}" \
         --workers "$WORKERS" --spine-weight "$weight" \
@@ -361,8 +365,8 @@ for job in "${JOBS[@]}"; do
     pq=$(grep -oE 'PQ \(micro\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
     sq=$(grep -oE 'SQ \(seg quality\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
     rq=$(grep -oE 'RQ \(recognition\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
-    label="$ENCODER  spine=$weight  seed=$SEED"
-    [ "$weight" = "0" ] && label="$ENCODER  baseline (spine off)  seed=$SEED"
+    label="$ENCODER  spine=$weight  bnd=$BOUNDARY  seed=$SEED"
+    [ "$weight" = "0" ] && label="$ENCODER  spine=0  bnd=$BOUNDARY  seed=$SEED"
     echo "$label  PQ=${pq:-unknown}  SQ=${sq:-?}  RQ=${rq:-?}" >> "$SUMMARY"
     publish_to_kaggle light || true
 done

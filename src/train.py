@@ -324,6 +324,13 @@ def main() -> None:
                         help="autocast precision; 'auto' picks bf16 on Ampere and "
                              "later, fp16 on older cards such as the Kaggle T4")
     parser.add_argument(
+        "--boundary-weight", type=float, default=0.0,
+        help="extra BCE weight on pixels near a mask edge; 0 disables it.  The "
+             "measured sensitivity is ~1.06 PQ per unit of mean matched IoU, and "
+             "a filament is a few pixels across, so its IoU is decided at the edge",
+    )
+    parser.add_argument("--boundary-radius", type=int, default=2)
+    parser.add_argument(
         "--seed", type=int, default=1234,
         help="base seed; the fold index is added to it.  Changing this is the "
              "only way to measure run-to-run variance, which is what decides "
@@ -409,6 +416,8 @@ def main() -> None:
         dice_weight=args.dice_weight,
         spine_weight=args.spine_weight,
         smoothing=args.label_smoothing,
+        boundary_weight=args.boundary_weight,
+        boundary_radius=args.boundary_radius,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay

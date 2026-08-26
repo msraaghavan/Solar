@@ -53,6 +53,25 @@ def masked_bce(
     return (loss * weight).sum() / denom
 
 
+def boundary_band(target: torch.Tensor, radius: int = 2) -> torch.Tensor:
+    """1 inside a band of ``radius`` pixels either side of every mask edge.
+
+    Morphological gradient, done with pooling so it stays on the GPU and inside
+    autograd's world: dilation is max-pooling, erosion is max-pooling the
+    negative.  The target is binary per reading, so the difference is exactly the
+    transition band.
+
+    Filaments are *thin*.  Erosion frequently removes a whole instance, in which
+    case the band covers all of it - which is correct rather than degenerate: for
+    a structure a few pixels across, every pixel is a boundary pixel, and that is
+    precisely why this metric is hard to score well on.
+    """
+    kernel = 2 * radius + 1
+    dilated = F.max_pool2d(target, kernel, stride=1, padding=radius)
+    eroded = -F.max_pool2d(-target, kernel, stride=1, padding=radius)
+    return (dilated - eroded).clamp(0.0, 1.0)
+
+
 def soft_dice(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -82,12 +101,31 @@ class FilamentLoss(nn.Module):
         aux_weights: tuple[float, ...] = (0.4, 0.2),
         spine_weight: float = 0.0,
         smoothing: float = 0.0,
+        boundary_weight: float = 0.0,
+        boundary_radius: int = 2,
     ):
         super().__init__()
         self.pos_weight = pos_weight
         self.dice_weight = dice_weight
         self.aux_weights = aux_weights
         self.smoothing = smoothing
+        # Extra weight on pixels within boundary_radius of a mask edge; 0 is off
+        # and reproduces every result measured before this existed, exactly.
+        #
+        # Why here and not a Lovasz term: the metric matches at IoU > 0.5
+        # strictly and scores each matched pair by its IoU, and the measured
+        # sensitivity is about 1.06 PQ per unit of mean matched IoU
+        # (tools/iou_headroom.py).  Nearly all of that IoU is decided at the
+        # edges, because a filament is a few pixels across.
+        #
+        # Crucially this does *not* break the argument the module docstring makes
+        # for BCE.  BCE decomposes over pixels, so a per-pixel weight leaves each
+        # pixel's minimiser at P(a random annotator marks it) and only changes how
+        # much that pixel contributes to the gradient.  A Lovasz or IoU surrogate
+        # would not be separable and would distort the calibration that
+        # postprocess.py's threshold tuning depends on.
+        self.boundary_weight = boundary_weight
+        self.boundary_radius = boundary_radius
         # Weight on the auxiliary spine channel.  Kept well below 1: the spine
         # is a means of shaping the representation - teaching the network that a
         # filament is one elongated object with an axis, unlike a sunspot - not
@@ -98,8 +136,15 @@ class FilamentLoss(nn.Module):
         self, logits: torch.Tensor, target: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
         """Loss over channel 0, plus the spine channel when both provide one."""
+        bce_weight = weight
+        if self.boundary_weight > 0:
+            band = boundary_band(target[:, :1], self.boundary_radius)
+            bce_weight = weight * (1.0 + self.boundary_weight * band)
+        # The boundary emphasis applies to BCE only.  soft_dice keeps the plain
+        # on-disk weight: it is a ratio of masses, so re-weighting pixels inside
+        # it would change what "overlap" means rather than where the loss looks.
         loss = masked_bce(
-            logits[:, :1], target[:, :1], weight, self.pos_weight, self.smoothing
+            logits[:, :1], target[:, :1], bce_weight, self.pos_weight, self.smoothing
         ) + self.dice_weight * soft_dice(logits[:, :1], target[:, :1], weight)
         if self.spine_weight > 0 and logits.shape[1] > 1 and target.shape[1] > 1:
             spine = masked_bce(
