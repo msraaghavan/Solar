@@ -236,6 +236,29 @@ the pod from a trap**, so it fires on success, on a failed job, on a crash and
 on Ctrl-C. `bootstrap_pod.sh` only prepares a pod and stops at a prompt; a
 finished pod bills exactly like a training one, so never leave that unattended.
 
+**What five smoke pods cost, and what they bought: $0.09 and five real bugs.**
+Every one of them would have destroyed a multi-hour experiment, and four were
+*silent* - the pod reported success:
+
+1. `timm` depends on torch, so pip satisfied it by pulling a PyPI build compiled
+   against a newer CUDA than the host driver. torch imported, reported its CUDA
+   version cheerfully, and saw no device.
+2. **CUDA error 804**, "forward compatibility was attempted on non supported HW":
+   the host driver was older than the image's CUDA. Pin `allowedCudaVersions`.
+3. The runpod images are bare - torch and torchaudio, no numpy, no torchvision -
+   and timm imports torchvision during `create_model`.
+4. The runner grepped `"pq_micro":` from a log that prints a *formatted report*,
+   so every result row read `PQ=unknown`.
+5. `kaggle datasets create` prints "title is already in use" and **exits 0**, so
+   `create || version` never falls through. A completed pod uploaded nothing
+   while reporting success, because its own bootstrap heartbeat had already
+   created the dataset.
+
+The general lesson, which is worth more than any of the five: **on a pod, check
+the message, not the exit status, and verify an extraction against a log you
+already know the answer to.** The PQ grep was validated by pointing it at the
+stored B0 fold-0 evaluation and confirming it returned 0.4387 / 0.6724 / 0.6524.
+
 Two rules the runner enforces, both of which cost money to learn otherwise:
 
 1. **Always `--smoke` first.** One epoch, five steps, two validation files.
