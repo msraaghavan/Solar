@@ -21,11 +21,19 @@ python tools/analysis.py
 
 | # | Question | Answer | What it decided |
 |---|---|---|---|
-| 1 | How well do **human annotators agree** with each other, in PQ? | **0.340** (SQ 0.634, RQ 0.536, hit rate 0.517) | The effective ceiling. A model near 0.34 is at human level; scores near 1.0 on the public leaderboard are not real. |
+| 1 | What would a **human-quality method** score, under the real metric? | **PQ 0.674** (SQ 0.874, RQ 0.771) | The achievable ceiling, and the target. Measured by scoring each annotator's own masks as *the* prediction against **every** reading of that observation, self-match included — which is how the scorer treats our single prediction per image. |
 | 2 | Does **averaging annotators** beat any single one? | union-of-two 0.646 vs single 0.637 IoU | Segmentation-quality ceiling ≈ 0.65, and a slightly *generous* boundary is closer to the average annotator → motivates `dilate_radius`. |
 | 3 | Is **semantic segmentation + connected components** enough, or is a learned instance head needed? | **PQ 0.9967** on ground truth (13 FP in 1982 instances) | Annotated filaments essentially never touch. No Mask R-CNN, no instance head — the task reduces to producing one good binary mask. |
 | 4 | What does working at **reduced resolution** cost? | round-trip IoU 0.868 @768, 0.888 @1024, 0.953 @1536 | Downsampling alone would consume more than the model could win back against a 0.65 ceiling → train and infer at **native 2048**, tiled. |
 | 5 | Does **limb-darkening correction** help, and where? | separability 1.300 → **1.578** at r/R 0.85–0.95; unchanged at disk centre | The flat field earns its place exactly where a naive dark-region detector fails — at the limb. |
+
+> **Do not use annotator-vs-annotator agreement as the ceiling.** Scoring annotator A
+> against annotator B alone gives PQ 0.329 (SQ 0.631, RQ 0.521), which is *below* this
+> model and would suggest the task is finished. That figure discards the self-match the
+> scorer always includes, so it is not a ceiling and never was. The decisive check that
+> annotator disagreement is not the binding constraint: out-of-fold PQ is **0.4163** on
+> single-annotator observations, where an exact match is achievable by construction,
+> against **0.4169** on multi-annotator ones.
 
 ### The operating point is derived, not tuned blindly
 
@@ -38,7 +46,7 @@ probability `p` pays whenever
 p · SQ > 0.5 · PQ        ⟺        p > 0.5 · PQ / SQ
 ```
 
-At the measured levels (PQ ≈ 0.34, SQ ≈ 0.64) the bar is **p > 0.27**. The optimum is
+At our measured levels (PQ 0.4167, SQ 0.6748) the bar is **p > 0.31**. The optimum is
 strongly recall-biased: emit anything with better than a one-in-four chance of being real.
 This is why the tuner searches low thresholds and small minimum areas.
 
