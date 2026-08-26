@@ -144,6 +144,23 @@ class FilamentNet(nn.Module):
                 ]
             )
 
+    @staticmethod
+    def tiling_for(checkpoint: dict) -> tuple[int, int]:
+        """``(tile_size, stride)`` for inference on a model, from how it trained.
+
+        ``predict_full`` defaults to 512/384 regardless of the checkpoint, which
+        has been correct only because every model so far trained on 512 tiles.  A
+        model trained at another tile size and evaluated at 512 sees a different
+        amount of context than it ever saw in training, and scores worse for a
+        reason unrelated to whatever was being tested - a false negative
+        indistinguishable from a real one.
+
+        The stride keeps the 0.75 overlap of the 512/384 pair, so the
+        cosine-blended reconstruction behaves the same way at any tile size.
+        """
+        tile = int(checkpoint.get("args", {}).get("tile_size") or 512)
+        return tile, int(round(tile * 0.75))
+
     @classmethod
     def from_checkpoint(cls, checkpoint: dict, device: str = "cpu") -> "FilamentNet":
         """Rebuild the architecture a checkpoint was trained with, from its weights.

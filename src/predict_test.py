@@ -33,6 +33,8 @@ def load_models(paths: list[str], device: str) -> list[torch.nn.Module]:
     for path in paths:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         model = FilamentNet.from_checkpoint(checkpoint, device)
+        tile_size, stride = FilamentNet.tiling_for(checkpoint)
+        model.tiling = (tile_size, stride)
         model.load_state_dict(checkpoint["model"])
         model.eval()
         models.append(model)
@@ -90,7 +92,8 @@ def main() -> None:
         for model in models:
             probability += predict_full(
                 model, image, context, tta=args.tta, device=args.device,
-                amp_dtype=args.amp_dtype
+                amp_dtype=args.amp_dtype,
+                tile_size=model.tiling[0], stride=model.tiling[1],
             )
         probability /= len(models)
 

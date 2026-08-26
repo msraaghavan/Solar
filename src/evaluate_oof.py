@@ -72,6 +72,9 @@ def load_fold_models(paths: list[str], device: str) -> dict[int, torch.nn.Module
         if fold in models:
             raise SystemExit(f"two checkpoints claim fold {fold}; refusing to guess")
         model = FilamentNet.from_checkpoint(checkpoint, device)
+        # Infer with the tiling this model trained under; every model in an
+        # ensemble is free to differ, so it travels with the model.
+        model.tiling = FilamentNet.tiling_for(checkpoint)
         model.load_state_dict(checkpoint["model"])
         model.eval()
         models[fold] = model
@@ -162,9 +165,11 @@ def main() -> None:
         disk = disk_mask_for(context)
 
         held_out_by = folds[file_name]
+        held_out_model = models[held_out_by]
         probability = predict_full(
-            models[held_out_by], image, context, tta=args.tta, device=args.device,
+            held_out_model, image, context, tta=args.tta, device=args.device,
             amp_dtype=args.amp_dtype,
+            tile_size=held_out_model.tiling[0], stride=held_out_model.tiling[1],
         )
         maps[file_name] = quantise(probability, disk)
 
@@ -176,6 +181,7 @@ def main() -> None:
                 total += predict_full(
                     model, image, context, tta=args.tta, device=args.device,
                     amp_dtype=args.amp_dtype,
+                    tile_size=model.tiling[0], stride=model.tiling[1],
                 )
             ensemble_maps[file_name] = quantise(total / len(models), disk)
 

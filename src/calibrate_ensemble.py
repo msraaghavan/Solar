@@ -66,6 +66,9 @@ def load_fold_models(paths: list[str], device: str) -> dict[int, torch.nn.Module
     for path in paths:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         model = FilamentNet.from_checkpoint(checkpoint, device)
+        # Infer with the tiling this model trained under; every model in an
+        # ensemble is free to differ, so it travels with the model.
+        model.tiling = FilamentNet.tiling_for(checkpoint)
         model.load_state_dict(checkpoint["model"])
         model.eval()
         models[checkpoint["args"]["fold"]] = model
@@ -161,8 +164,9 @@ def main() -> None:
         n_pixels = int(on_disk.sum())
 
         maps = {
-            fold: predict_full(model, image, context, tta=args.tta,
-                                 device=args.device, amp_dtype=args.amp_dtype)
+            fold: predict_full(model, image, context, tta=args.tta, device=args.device,
+                                 amp_dtype=args.amp_dtype,
+                                 tile_size=model.tiling[0], stride=model.tiling[1])
             for fold, model in models.items()
         }
 

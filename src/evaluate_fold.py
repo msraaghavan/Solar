@@ -60,6 +60,8 @@ def main() -> None:
     # (two output channels) or a stem skip is picked up without either being
     # recorded in args - which is what lets checkpoints predating a flag load.
     model = FilamentNet.from_checkpoint(checkpoint, args.device)
+    # Infer at the tile size this model trained on, not a fixed 512.
+    tile_size, stride = FilamentNet.tiling_for(checkpoint)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     print(f"loaded {args.checkpoint} (encoder {encoder}, epoch {checkpoint.get('epoch')})", flush=True)
@@ -80,7 +82,7 @@ def main() -> None:
         context = contexts[file_name]
         probability = predict_full(
             model, image, context, tta=args.tta, device=args.device,
-            amp_dtype=args.amp_dtype,
+            amp_dtype=args.amp_dtype, tile_size=tile_size, stride=stride,
         )
         mask = disk_mask_for(context)
         # An observation read by three annotators yields three scoring entries
