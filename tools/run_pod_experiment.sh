@@ -179,10 +179,18 @@ publish_to_kaggle() {
 META
 
     echo "=== publishing $(ls -1 "$stage" | wc -l) files (${1:-full}) to kaggle $slug ==="
-    # create the first time, version every time after.  Either can be the one
-    # that works, so try both and let the summary below report what landed.
-    python -m kaggle datasets create -p "$stage" -r zip -q 2>&1 | tail -3 ||
-    python -m kaggle datasets version -p "$stage" -r zip -m "pod $RUN_TAG" -q 2>&1 | tail -3
+    # `kaggle datasets create` prints "title is already in use" and *exits 0*,
+    # so `create || version` never falls through and the second publish
+    # silently uploads nothing.  That is exactly how the first successful
+    # smoke pod lost its checkpoints and logs: the bootstrap heartbeat had
+    # already created the dataset, so the final full publish did nothing at
+    # all while reporting success.  Decide on the message, not the status.
+    out=$(python -m kaggle datasets create -p "$stage" -r zip -q 2>&1)
+    echo "$out" | tail -3
+    case "$out" in
+        *"already in use"*|*"already exists"*)
+            python -m kaggle datasets version -p "$stage" -r zip -m "pod $RUN_TAG ${1:-full}" -q 2>&1 | tail -3 ;;
+    esac
     echo "=== kaggle dataset: $slug ==="
 }
 
@@ -344,11 +352,18 @@ for job in "${JOBS[@]}"; do
         --out "$ARTIFACT_DIR/fold${FOLD}_${tag}_tuned.json" "${EVAL_ARGS[@]}" \
         2>&1 | tee "$ARTIFACT_DIR/eval_${tag}.log"
 
-    pq=$(grep -oE '"pq_micro":[[:space:]]*[0-9.]+' "$ARTIFACT_DIR/eval_${tag}.log" \
-         | tail -1 | grep -oE '[0-9.]+$')
+    # evaluate_fold prints a formatted report, not JSON, so the old grep for
+    # '"pq_micro":' matched nothing and every row read PQ=unknown - a whole
+    # pod's result reduced to a word.  'PQ (micro)' carries the number, and it
+    # equals the honest held-out estimate: the reference B0 fold-0 run printed
+    # 'PQ on the held-out half 0.4387' and 'PQ (micro) 0.4387' alike.
+    elog="$ARTIFACT_DIR/eval_${tag}.log"
+    pq=$(grep -oE 'PQ \(micro\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
+    sq=$(grep -oE 'SQ \(seg quality\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
+    rq=$(grep -oE 'RQ \(recognition\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
     label="$ENCODER  spine=$weight  seed=$SEED"
     [ "$weight" = "0" ] && label="$ENCODER  baseline (spine off)  seed=$SEED"
-    echo "$label  PQ=${pq:-unknown}" >> "$SUMMARY"
+    echo "$label  PQ=${pq:-unknown}  SQ=${sq:-?}  RQ=${rq:-?}" >> "$SUMMARY"
     publish_to_kaggle light || true
 done
 

@@ -129,7 +129,43 @@ if [ ! -d "$DATA/MAGFiLO_1.0_Kaggle_2026" ]; then
     unzip -q -d "$DATA" "$DATA"/*.zip && rm -f "$DATA"/*.zip
 fi
 
-python src/build_disk_cache.py --root "$DATA/MAGFiLO_1.0_Kaggle_2026"
+# The disk geometry and the per-image contexts are pure functions of the images,
+# and both are already published as raaghavanms/filament-cache (348 KB total).
+# Fetching them costs seconds; rebuilding the contexts costs 8.7 minutes of a
+# 4090 sitting idle, measured on the first successful pod - per pod, every time.
+mkdir -p artifacts
+python -m kaggle datasets download -d raaghavanms/filament-cache -p artifacts --unzip -q ||
+    echo "cache download failed; will rebuild from the images"
+
+# Trust it only if it actually describes this dataset.  A stale or partial cache
+# would hand training the wrong disk geometry for every image, silently.
+python - <<'CHECK'
+import glob, json, os, sys
+sys.path.insert(0, "src")
+names = {os.path.basename(p) for p in glob.glob(
+    "data/MAGFiLO_1.0_Kaggle_2026/train/train_images/*.jpeg")}
+ok = True
+if os.path.exists("artifacts/disk_cache.json"):
+    cache = json.load(open("artifacts/disk_cache.json"))
+    missing = names - set(cache)
+    if missing:
+        print(f"disk cache is missing {len(missing)} of {len(names)} images; rebuilding")
+        os.remove("artifacts/disk_cache.json")
+        ok = False
+    else:
+        print(f"disk cache covers all {len(names)} train images")
+if ok and os.path.exists("artifacts/contexts.npz"):
+    from data import load_contexts
+    contexts = load_contexts("artifacts/contexts.npz")
+    if names - set(contexts):
+        print(f"context cache covers only {len(contexts)}; rebuilding")
+        os.remove("artifacts/contexts.npz")
+    else:
+        print(f"context cache covers all {len(contexts)} train images")
+CHECK
+
+[ -f artifacts/disk_cache.json ] ||
+    python src/build_disk_cache.py --root "$DATA/MAGFiLO_1.0_Kaggle_2026"
 python tests/test_pipeline.py
 python tests/test_official_metric.py
 
