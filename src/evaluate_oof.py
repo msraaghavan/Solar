@@ -71,11 +71,7 @@ def load_fold_models(paths: list[str], device: str) -> dict[int, torch.nn.Module
         n_folds.add(checkpoint["args"]["n_folds"])
         if fold in models:
             raise SystemExit(f"two checkpoints claim fold {fold}; refusing to guess")
-        model = FilamentNet(
-            encoder_name=checkpoint["args"]["encoder"],
-            pretrained=False,
-            out_channels=checkpoint["model"]["head.weight"].shape[0],
-        ).to(device)
+        model = FilamentNet.from_checkpoint(checkpoint, device)
         model.load_state_dict(checkpoint["model"])
         model.eval()
         models[fold] = model

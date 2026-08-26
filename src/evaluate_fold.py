@@ -56,12 +56,10 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     encoder = checkpoint["args"]["encoder"]
-    # A checkpoint trained with the auxiliary spine head has two output
-    # channels; only channel 0 (the filament mask) is used at inference.
-    out_channels = checkpoint["model"]["head.weight"].shape[0]
-    model = FilamentNet(
-        encoder_name=encoder, pretrained=False, out_channels=out_channels
-    ).to(args.device)
+    # from_checkpoint reads the architecture off the weights, so a spine head
+    # (two output channels) or a stem skip is picked up without either being
+    # recorded in args - which is what lets checkpoints predating a flag load.
+    model = FilamentNet.from_checkpoint(checkpoint, args.device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     print(f"loaded {args.checkpoint} (encoder {encoder}, epoch {checkpoint.get('epoch')})", flush=True)

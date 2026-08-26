@@ -7,7 +7,22 @@ but not smp, and the decoder needs two departures from the stock design.
 *Full-resolution output.*  Standard timm encoders stride the input by 32 and the
 usual U-Net stops decoding at stride 2, upsampling the logits at the end.  Solar
 filament barbs are a few pixels wide, so the decoder here runs all the way back
-to stride 1 with a learned block, and a stride-1 stem skip is carried across.
+to stride 1 with a learned block.
+
+*Stride-1 stem skip* (``stem_skip``, default off).  A timm ``features_only``
+encoder emits nothing above stride 2, so without this the final stride-2 ->
+stride-1 block has no skip at all: it sees a nearest-neighbour upsample of the
+/2 features through 16 channels and nothing else, and therefore cannot locate an
+edge more precisely than the /2 grid allows.  That is a candidate explanation for
+mean matched IoU sitting at 0.67 from epoch 6 onwards regardless of encoder,
+training length or fold - see the SQ section of HANDOVER.md.  Switching it on
+adds one full-resolution convolution over the input and hands its output to that
+last block as a skip.
+
+(An earlier version of this docstring asserted the stem skip was already carried
+across.  It was not - the last entry of ``skips`` was a literal 0 - so any
+reasoning that relied on the model having full-resolution detail available was
+reasoning about a model that did not exist.)
 
 *Squeeze-excite in the decoder.*  Filament contrast varies with radius and
 seeing; a cheap channel gate lets each block rescale features rather than
@@ -78,6 +93,8 @@ class FilamentNet(nn.Module):
         decoder_channels: tuple[int, ...] = (256, 128, 64, 32, 16),
         deep_supervision: bool = True,
         out_channels: int = 1,
+        stem_skip: bool = False,
+        stem_channels: int = 16,
     ):
         super().__init__()
         import timm
@@ -96,8 +113,17 @@ class FilamentNet(nn.Module):
             )
         self.deep_supervision = deep_supervision
 
-        # Encoder features run [/2, /4, /8, /16, /32]; decode back to /1.
-        skips = [encoder_channels[3], encoder_channels[2], encoder_channels[1], encoder_channels[0], 0]
+        # Encoder features run [/2, /4, /8, /16, /32]; decode back to /1.  The
+        # final block's skip is the stem when enabled and nothing otherwise -
+        # there is no encoder feature at stride 1 to use instead.
+        self.stem = ConvBNAct(in_channels, stem_channels) if stem_skip else None
+        skips = [
+            encoder_channels[3],
+            encoder_channels[2],
+            encoder_channels[1],
+            encoder_channels[0],
+            stem_channels if stem_skip else 0,
+        ]
         blocks = []
         in_ch = encoder_channels[4]
         for out_ch, skip_ch in zip(decoder_channels, skips):
@@ -118,9 +144,40 @@ class FilamentNet(nn.Module):
                 ]
             )
 
+    @classmethod
+    def from_checkpoint(cls, checkpoint: dict, device: str = "cpu") -> "FilamentNet":
+        """Rebuild the architecture a checkpoint was trained with, from its weights.
+
+        Four call sites used to reconstruct this by hand, each reading a slightly
+        different subset of the saved state - and each therefore able to drift.
+        Two architecture choices are invisible in ``args`` for older checkpoints
+        and have to be read off the weights themselves:
+
+        * ``out_channels``, which is 2 when the auxiliary spine head was on;
+        * ``stem_skip``, which adds ``stem.*`` parameters.
+
+        Reading the weights rather than ``args`` also means a checkpoint trained
+        before a flag existed still loads, which is what keeps every earlier
+        result reproducible.
+        """
+        state = checkpoint["model"]
+        args = checkpoint.get("args", {})
+        return cls(
+            encoder_name=args.get("encoder", "tf_efficientnet_b4"),
+            pretrained=False,
+            out_channels=state["head.weight"].shape[0],
+            stem_skip=any(k.startswith("stem.") for k in state),
+        ).to(device)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         features = self.encoder(x)          # [/2, /4, /8, /16, /32]
-        skips = [features[3], features[2], features[1], features[0], None]
+        skips = [
+            features[3],
+            features[2],
+            features[1],
+            features[0],
+            self.stem(x) if self.stem is not None else None,
+        ]
 
         y = features[4]
         intermediates = []

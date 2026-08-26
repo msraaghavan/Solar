@@ -43,6 +43,7 @@ KEEP_ALIVE=${KEEP_ALIVE:-0}       # 1 = do not terminate (debugging only)
 SPINE_WEIGHTS=()
 ENCODERS=()
 BOUNDARIES=()
+STEMS=()
 FOLD=${FOLD:-0}
 EPOCHS=${EPOCHS:-30}
 # Two pods running the same configuration at different seeds is how run-to-run
@@ -62,6 +63,7 @@ while [ $# -gt 0 ]; do
         --epochs) EPOCHS="$2"; shift 2 ;;
         --encoder) ENCODERS+=("$2"); shift 2 ;;
         --boundary) BOUNDARIES+=("$2"); shift 2 ;;
+        --stem) STEMS+=("$2"); shift 2 ;;
         --no-baseline) BASELINE=0; shift ;;
         --smoke)  SMOKE=1; shift ;;
         --keep-alive) KEEP_ALIVE=1; shift ;;
@@ -73,6 +75,8 @@ done
 # Falls back to the pod-level BOUNDARY (default 0), so existing invocations and
 # every result measured before this axis existed are unaffected.
 [ ${#BOUNDARIES[@]} -eq 0 ] && BOUNDARIES=("$BOUNDARY")
+# 0/1 rather than a flag, so it composes with the other axes.
+[ ${#STEMS[@]} -eq 0 ] && STEMS=(0)
 
 # --smoke: one epoch, five steps, two validation files.  Costs a few cents and
 # exercises every path that can fail after an hour of billing - the spine
@@ -125,7 +129,9 @@ JOBS=()
 for enc in "${ENCODERS[@]}"; do
     for w in "${SPINE_WEIGHTS[@]}"; do
         for b in "${BOUNDARIES[@]}"; do
-            JOBS+=("$enc|$w|$b")
+            for st in "${STEMS[@]}"; do
+                JOBS+=("$enc|$w|$b|$st")
+            done
         done
     done
 done
@@ -329,17 +335,21 @@ for job in "${JOBS[@]}"; do
     ENCODER="${job%%|*}"
     rest="${job#*|}"
     weight="${rest%%|*}"
-    BOUNDARY="${rest##*|}"
+    rest="${rest#*|}"
+    BOUNDARY="${rest%%|*}"
+    STEM="${rest##*|}"
+    stem_flag=()
+    [ "$STEM" = "1" ] && stem_flag=(--stem-skip)
     # Tags every artefact for this job.  It has to carry the encoder as well as
     # the weight, or a two-encoder queue silently overwrites its own results.
-    tag="${ENCODER#tf_efficientnet_}_spine${weight}_bnd${BOUNDARY}_seed${SEED}"
+    tag="${ENCODER#tf_efficientnet_}_sp${weight}_bnd${BOUNDARY}_stem${STEM}_s${SEED}"
     echo ""
-    echo "=== fold $FOLD, encoder $ENCODER, spine-weight $weight, boundary-weight $BOUNDARY ==="
+    echo "=== fold $FOLD, $ENCODER, spine $weight, boundary $BOUNDARY, stem $STEM ==="
     default_val=(--val-every 3 --val-files 40)
     [ "$SMOKE" = "1" ] && default_val=()
     python src/train.py \
         --fold "$FOLD" --encoder "$ENCODER" --seed "$SEED" \
-        --boundary-weight "$BOUNDARY" \
+        --boundary-weight "$BOUNDARY" "${stem_flag[@]}" \
         --tile-size 512 --batch-size 8 --tiles-per-sample 8 \
         --epochs "$EPOCHS" "${default_val[@]}" "${SMOKE_ARGS[@]}" \
         --workers "$WORKERS" --spine-weight "$weight" \
@@ -382,8 +392,7 @@ for job in "${JOBS[@]}"; do
     pq=$(grep -oE 'PQ \(micro\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
     sq=$(grep -oE 'SQ \(seg quality\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
     rq=$(grep -oE 'RQ \(recognition\)[[:space:]]+[0-9.]+' "$elog" | tail -1 | grep -oE '[0-9.]+$')
-    label="$ENCODER  spine=$weight  bnd=$BOUNDARY  seed=$SEED"
-    [ "$weight" = "0" ] && label="$ENCODER  spine=0  bnd=$BOUNDARY  seed=$SEED"
+    label="$ENCODER  spine=$weight  bnd=$BOUNDARY  stem=$STEM  seed=$SEED"
     echo "$label  PQ=${pq:-unknown}  SQ=${sq:-?}  RQ=${rq:-?}" >> "$SUMMARY"
     publish_to_kaggle light || true
 done

@@ -32,11 +32,7 @@ def load_models(paths: list[str], device: str) -> list[torch.nn.Module]:
     models = []
     for path in paths:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        model = FilamentNet(
-            encoder_name=checkpoint["args"]["encoder"],
-            pretrained=False,
-            out_channels=checkpoint["model"]["head.weight"].shape[0],
-        ).to(device)
+        model = FilamentNet.from_checkpoint(checkpoint, device)
         model.load_state_dict(checkpoint["model"])
         model.eval()
         models.append(model)

@@ -331,6 +331,13 @@ def main() -> None:
     )
     parser.add_argument("--boundary-radius", type=int, default=2)
     parser.add_argument(
+        "--stem-skip", action="store_true",
+        help="give the final stride-2 -> stride-1 decoder block a "
+             "full-resolution skip from the input.  Without it that block "
+             "sees only an upsampled /2 feature map and cannot place an edge "
+             "more precisely than the /2 grid allows",
+    )
+    parser.add_argument(
         "--seed", type=int, default=1234,
         help="base seed; the fold index is added to it.  Changing this is the "
              "only way to measure run-to-run variance, which is what decides "
@@ -409,6 +416,7 @@ def main() -> None:
         encoder_name=args.encoder,
         pretrained=not args.no_pretrained,
         out_channels=2 if args.spine_weight > 0 else 1,
+        stem_skip=args.stem_skip,
     ).to(args.device)
     ema = EMA(model)
     criterion = FilamentLoss(

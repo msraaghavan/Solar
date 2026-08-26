@@ -259,8 +259,19 @@ the multi-annotator figure (0.4169).
 That leaves the objective. `FilamentLoss` is BCE plus a *semantic* soft-Dice
 pooled over the whole tile; neither term rewards putting an edge in exactly the
 right place, and predictions are only 8% too large by area, so the error is edge
-*position*, not mask size. **`--boundary-weight` is the direct test of this and
-is running now.** If it moves SQ off 0.67 it is worth far more than anything else
+*position*, not mask size. **Two direct tests of this are running now.**
+
+`--boundary-weight` puts extra BCE weight on a rim either side of each edge.
+
+`--stem-skip` fixes something the model docstring *claimed* and the code did not
+do. A timm `features_only` encoder emits nothing above stride 2, and the last
+entry of the decoder's skip list was a literal `0` - so the final stride-2 ->
+stride-1 block received **no skip at all**. It saw a nearest-neighbour upsample
+of the /2 features through 16 channels and nothing else, and so could not place
+an edge more precisely than the /2 grid allows. That is exactly the shape of a
+hard ceiling on mean matched IoU that no amount of training moves. The flag adds
+one full-resolution convolution over the input (+3K parameters, 0.05%) and hands
+it to that block. If it moves SQ off 0.67 it is worth far more than anything else
 on the list; if it does not, the next candidates are output resolution and tile
 size, not more epochs and not a bigger encoder.
 
@@ -447,9 +458,9 @@ retrains, pooled OOF fits, calibration and prediction all belong on Kaggle, free
 Note the weekly quota resets: the 25.7 h recorded earlier was from the week of
 14 Aug and does not still apply.
 
-## Tests — 50 checks, all passing
+## Tests — 51 checks, all passing
 
-`python tests/test_pipeline.py` (43) and `python tests/test_official_metric.py`
+`python tests/test_pipeline.py` (44) and `python tests/test_official_metric.py`
 (7). No pytest needed. Runs in ~4 s on CPU. Several encode real bugs:
 
 - the tuning grid must bracket every fitted value **and** every fitted value in

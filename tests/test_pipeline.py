@@ -873,6 +873,43 @@ def _():
     print(f"      ({inside:.1%} alignment over {len(chosen)} readings)", end="")
 
 
+@check("a checkpoint rebuilds its own architecture, stem skip and spine head alike")
+def _():
+    import torch
+    from model import FilamentNet
+
+    # Two architecture choices are absent from `args` in older checkpoints and
+    # must be read off the weights: the spine head's second output channel, and
+    # the stem skip's parameters.  Four call sites used to infer this by hand.
+    for stem in (False, True):
+        for out_channels in (1, 2):
+            model = FilamentNet(
+                "tf_efficientnet_b0", pretrained=False,
+                out_channels=out_channels, stem_skip=stem,
+            )
+            checkpoint = {"model": model.state_dict(),
+                          "args": {"encoder": "tf_efficientnet_b0"}}
+            rebuilt = FilamentNet.from_checkpoint(checkpoint)
+            rebuilt.load_state_dict(checkpoint["model"])   # raises on any mismatch
+            assert (rebuilt.stem is not None) == stem
+            assert rebuilt.out_channels == out_channels
+
+    # The stem skip must actually reach the last decoder block, or it is an
+    # expensive no-op that still looks like it works.
+    plain = FilamentNet("tf_efficientnet_b0", pretrained=False, stem_skip=False)
+    with_stem = FilamentNet("tf_efficientnet_b0", pretrained=False, stem_skip=True)
+    assert with_stem.blocks[-1].conv1[0].in_channels > plain.blocks[-1].conv1[0].in_channels, (
+        "the final stride-1 block must receive the stem as a skip"
+    )
+    assert plain.blocks[-1].conv1[0].in_channels == plain.blocks[-2].conv2[0].out_channels, (
+        "without the stem the final block has no skip at all - this is the "
+        "behaviour the docstring once wrongly claimed was a stride-1 stem skip"
+    )
+    with torch.no_grad():
+        out = with_stem.eval()(torch.randn(1, 3, 64, 64))
+    assert out.shape[-2:] == (64, 64), "output must stay at input resolution"
+
+
 @check("the boundary term is exactly inert at weight 0, and proper at any weight")
 def _():
     import torch
