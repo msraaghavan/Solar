@@ -228,6 +228,7 @@ def launch(argv: argparse.Namespace, passthrough: list[str]) -> None:
     env["SEED"] = str(argv.seed)
     env["BOUNDARY"] = str(argv.boundary)
     env["FOLD"] = str(argv.fold)
+    env["BATCH"] = str(argv.batch)
 
     # Refuse to create a second pod under a tag that is already running.  Two
     # pods sharing a tag publish to the *same* Kaggle dataset, so they race and
@@ -320,6 +321,9 @@ def main() -> None:
     p.add_argument("--vcpus", type=int, default=8)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--boundary", type=float, default=0.0)
+    p.add_argument("--batch", type=int, default=8,
+                   help="pod-level batch size; lower it for large tiles so "
+                        "both arms of a tile comparison can afford the same one")
     p.add_argument("--fold", type=int, default=0,
                    help="which fold to train; five pods at folds 0-4 rebuild "
                         "the whole ensemble in one fold's wall-clock")
