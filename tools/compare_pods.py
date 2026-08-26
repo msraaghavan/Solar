@@ -44,9 +44,13 @@ def fetch(tag: str, into: str) -> str | None:
     """Download one pod's results; return its summary text, or None."""
     target = os.path.join(into, tag)
     os.makedirs(target, exist_ok=True)
+    # One file, not the dataset.  A finished pod's dataset carries two ~24 MB
+    # checkpoints, and pulling those to read a 250-byte text file took long
+    # enough to time out - for information already sitting in pod_summary.txt.
     result = subprocess.run(
         [sys.executable, "-m", "kaggle", "datasets", "download",
-         "-d", f"raaghavanms/filament-pod-{tag}", "-p", target, "--unzip", "-q"],
+         "-d", f"raaghavanms/filament-pod-{tag}", "-f", "pod_summary.txt",
+         "-p", target, "--unzip", "-q"],
         capture_output=True, text=True,
     )
     path = os.path.join(target, "pod_summary.txt")
